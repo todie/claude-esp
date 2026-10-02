@@ -23,8 +23,8 @@ Thumbs.db
 # Claude Code local settings
 .claude/
 
-# Beads issue tracking (local db)
-.beads/
+# Local debug scratch
+.debug/
 
 # Claude artifacts
 AGENTS.md

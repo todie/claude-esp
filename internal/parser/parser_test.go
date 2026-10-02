@@ -2,9 +2,11 @@ package parser
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestParseLine_EmptyLine(t *testing.T) {
@@ -266,13 +268,216 @@ func TestParseLine_EmptyThinking(t *testing.T) {
 }
 
 func TestParseLine_UnknownType(t *testing.T) {
-	line := `{"type":"system","timestamp":"2025-01-01T12:00:00Z","message":{}}`
+	// System messages with unrecognized subtypes should be silently dropped.
+	line := `{"type":"system","subtype":"something_else","timestamp":"2025-01-01T12:00:00Z","message":{}}`
 	items, err := ParseLine(line)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(items) != 0 {
-		t.Errorf("expected 0 items for unknown type, got %d", len(items))
+		t.Errorf("expected 0 items for unknown system subtype, got %d", len(items))
+	}
+}
+
+func TestParseLine_SessionTitleAgentName(t *testing.T) {
+	line := `{"type":"agent-name","agentName":"auto-collapse-feature","sessionId":"sess-1"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 title item, got %d", len(items))
+	}
+	if items[0].Type != TypeSessionTitle {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeSessionTitle)
+	}
+	if items[0].Content != "auto-collapse-feature" {
+		t.Errorf("content = %q, want auto-collapse-feature", items[0].Content)
+	}
+	if items[0].SessionID != "sess-1" {
+		t.Errorf("sessionID = %q, want sess-1", items[0].SessionID)
+	}
+}
+
+func TestParseLine_SessionTitleCustomTitle(t *testing.T) {
+	line := `{"type":"custom-title","customTitle":"my-custom-label","sessionId":"sess-2"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Content != "my-custom-label" {
+		t.Fatalf("expected my-custom-label, got %+v", items)
+	}
+}
+
+func TestParseLine_TurnDuration(t *testing.T) {
+	line := `{"type":"system","subtype":"turn_duration","timestamp":"2025-01-01T12:00:00Z","durationMs":41751,"messageCount":42,"sessionId":"abc"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 turn marker, got %d", len(items))
+	}
+	if items[0].Type != TypeTurnMarker {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeTurnMarker)
+	}
+	if items[0].DurationMs != 41751 {
+		t.Errorf("duration = %d, want 41751", items[0].DurationMs)
+	}
+}
+
+func TestParseLine_CompactBoundary(t *testing.T) {
+	line := `{"type":"system","subtype":"compact_boundary","timestamp":"2025-01-01T12:00:00Z","sessionId":"abc","compactMetadata":{"trigger":"auto","preTokens":179698}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 compact marker, got %d", len(items))
+	}
+	if items[0].Type != TypeCompactMarker {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeCompactMarker)
+	}
+	if items[0].Content != "auto, 179k pre-tokens" {
+		t.Errorf("content = %q, want %q", items[0].Content, "auto, 179k pre-tokens")
+	}
+	if items[0].SessionID != "abc" {
+		t.Errorf("sessionID = %q, want abc", items[0].SessionID)
+	}
+}
+
+func TestParseLine_CompactBoundary_NoMetadata(t *testing.T) {
+	line := `{"type":"system","subtype":"compact_boundary","timestamp":"2025-01-01T12:00:00Z","sessionId":"abc"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeCompactMarker {
+		t.Fatalf("expected 1 compact marker, got %+v", items)
+	}
+	if items[0].Content != "" {
+		t.Errorf("content = %q, want empty", items[0].Content)
+	}
+}
+
+func TestParseLine_HookSuccess(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"abc","attachment":{"type":"hook_success","hookName":"SessionStart:startup","hookEvent":"SessionStart","stdout":"hello\nworld","exitCode":0,"durationMs":116,"command":"bd prime"}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 hook item, got %d", len(items))
+	}
+	if items[0].Type != TypeHookOutput {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeHookOutput)
+	}
+	if items[0].ToolName != "SessionStart:startup" {
+		t.Errorf("toolName = %q, want SessionStart:startup", items[0].ToolName)
+	}
+	if items[0].DurationMs != 116 {
+		t.Errorf("duration = %d, want 116", items[0].DurationMs)
+	}
+	if items[0].Content != "hello\nworld" {
+		t.Errorf("content = %q, want hello\\nworld", items[0].Content)
+	}
+}
+
+func TestParseLine_AttachmentUnknownSubtypeDropped(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"abc","attachment":{"type":"task_reminder","content":[],"itemCount":0}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items for unhandled subtype, got %d", len(items))
+	}
+}
+
+func TestParseLine_Diagnostics(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"abc","attachment":{"type":"diagnostics","files":[{"uri":"/path/to/foo.go","diagnostics":[{"message":"unused parameter","severity":"Info","source":"unusedparams"},{"message":"loop can be modernized","severity":"Hint","source":"rangeint"}]}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 diagnostics item, got %d", len(items))
+	}
+	if items[0].Type != TypeDiagnostics {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeDiagnostics)
+	}
+	if items[0].ToolName != "foo.go (1 info, 1 hint)" {
+		t.Errorf("toolName = %q, want %q", items[0].ToolName, "foo.go (1 info, 1 hint)")
+	}
+	if !strings.Contains(items[0].Content, "[Info] unused parameter (unusedparams)") {
+		t.Errorf("content missing first diagnostic: %q", items[0].Content)
+	}
+}
+
+func TestParseLine_DebugAll(t *testing.T) {
+	prev := DebugAll
+	DebugAll = true
+	t.Cleanup(func() { DebugAll = prev })
+
+	tests := []struct {
+		name      string
+		line      string
+		wantLabel string
+	}{
+		{"unknown top-level", `{"type":"file-history-snapshot","sessionId":"s","timestamp":"2025-01-01T12:00:00Z"}`, "file-history-snapshot"},
+		{"system unknown subtype", `{"type":"system","subtype":"foo","sessionId":"s","timestamp":"2025-01-01T12:00:00Z"}`, "system:foo"},
+		{"attachment unhandled", `{"type":"attachment","sessionId":"s","timestamp":"2025-01-01T12:00:00Z","attachment":{"type":"task_reminder","content":[],"itemCount":0}}`, "attachment.task_reminder"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := ParseLine(tc.line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 1 || items[0].Type != TypeDebug {
+				t.Fatalf("expected 1 debug item, got %+v", items)
+			}
+			if items[0].ToolName != tc.wantLabel {
+				t.Errorf("label = %q, want %q", items[0].ToolName, tc.wantLabel)
+			}
+		})
+	}
+}
+
+func TestParseLine_DebugAllSkipsHandledLines(t *testing.T) {
+	prev := DebugAll
+	DebugAll = true
+	t.Cleanup(func() { DebugAll = prev })
+
+	// pr-link is handled → should NOT also produce a debug item.
+	line := `{"type":"pr-link","sessionId":"s","prNumber":1,"prUrl":"http://x","prRepository":"a/b","timestamp":"2025-01-01T12:00:00Z"}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Type != TypePRLink {
+		t.Fatalf("expected exactly 1 pr_link item, got %+v", items)
+	}
+}
+
+func TestParseLine_PRLink(t *testing.T) {
+	line := `{"type":"pr-link","sessionId":"abc","prNumber":13,"prUrl":"https://github.com/phiat/claude-esp/pull/13","prRepository":"phiat/claude-esp","timestamp":"2025-01-01T12:00:00Z"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypePRLink {
+		t.Fatalf("expected 1 pr_link item, got %+v", items)
+	}
+	want := "PR #13 phiat/claude-esp → https://github.com/phiat/claude-esp/pull/13"
+	if items[0].Content != want {
+		t.Errorf("content = %q, want %q", items[0].Content, want)
+	}
+}
+
+func TestParseLine_DiagnosticsEmptyFilesSkipped(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"abc","attachment":{"type":"diagnostics","files":[{"uri":"/x.go","diagnostics":[]}]}}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected files with no diagnostics to be skipped, got %d items", len(items))
 	}
 }
 
@@ -291,6 +496,20 @@ func TestFormatToolInput(t *testing.T) {
 		{"Glob no path", "Glob", `{"pattern":"*.go"}`, "*.go"},
 		{"Grep with path", "Grep", `{"pattern":"TODO","path":"/src"}`, "/TODO/ in /src"},
 		{"Grep no path", "Grep", `{"pattern":"TODO"}`, "/TODO/"},
+		{"Agent with desc", "Agent", `{"description":"audit deps","prompt":"check all deps"}`, "audit deps"},
+		{"Agent prompt fallback", "Agent", `{"prompt":"do a thing"}`, "do a thing"},
+		{"Task legacy alias", "Task", `{"description":"legacy task"}`, "legacy task"},
+		{"Skill with args", "Skill", `{"skill":"beads:create","args":"--title x"}`, "beads:create — --title x"},
+		{"Skill no args", "Skill", `{"skill":"beads:list"}`, "beads:list"},
+		{"ToolSearch", "ToolSearch", `{"query":"select:Read","max_results":1}`, "select:Read"},
+		{"ScheduleWakeup reason", "ScheduleWakeup", `{"delaySeconds":90,"reason":"watching build"}`, "watching build"},
+		{"ScheduleWakeup delay only", "ScheduleWakeup", `{"delaySeconds":90}`, "delay 90s"},
+		{"TaskCreate", "TaskCreate", `{"subject":"write docs","activeForm":"writing"}`, "write docs"},
+		{"TaskUpdate", "TaskUpdate", `{"taskId":"42","status":"in_progress"}`, "task 42"},
+		{"TaskStop", "TaskStop", `{"task_id":"abc123"}`, "abc123"},
+		{"EnterPlanMode", "EnterPlanMode", `{}`, "enter plan mode"},
+		{"ExitPlanMode", "ExitPlanMode", `{}`, "exit plan mode"},
+		{"CronCreate", "CronCreate", `{"cron":"*/5 * * * *","prompt":"ping","recurring":true}`, "*/5 * * * *"},
 		{"Unknown tool", "CustomTool", `{"foo":"bar"}`, `"foo"`},
 		{"Invalid JSON", "Bash", `not json`, "not json"},
 	}
@@ -369,4 +588,876 @@ func buildAssistantLine(t *testing.T, toolName, toolID string, inputJSON json.Ra
 		t.Fatalf("failed to build test line: %v", err)
 	}
 	return string(data)
+}
+
+func TestParseLine_TokenUsageInAssistantMessage(t *testing.T) {
+	// Test that usage data is correctly extracted from assistant messages
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}],"usage":{"input_tokens":123,"output_tokens":456}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	if item.InputTokens != 123 {
+		t.Errorf("InputTokens = %d, want 123", item.InputTokens)
+	}
+	if item.OutputTokens != 456 {
+		t.Errorf("OutputTokens = %d, want 456", item.OutputTokens)
+	}
+}
+
+func TestParseLine_MultipleBlocks_TokensOnFirstBlock(t *testing.T) {
+	// When an assistant message has multiple content blocks, tokens should be
+	// attached to the FIRST item only (not duplicated across all blocks)
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"I think"},{"type":"text","text":"I respond"}],"usage":{"input_tokens":100,"output_tokens":200}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 items, got %d", len(items))
+	}
+
+	// First item (thinking) should have token data
+	if items[0].InputTokens != 100 {
+		t.Errorf("items[0].InputTokens = %d, want 100", items[0].InputTokens)
+	}
+	if items[0].OutputTokens != 200 {
+		t.Errorf("items[0].OutputTokens = %d, want 200", items[0].OutputTokens)
+	}
+
+	// Second item (text) should NOT have token data
+	if items[1].InputTokens != 0 {
+		t.Errorf("items[1].InputTokens = %d, want 0 (tokens only on first item)", items[1].InputTokens)
+	}
+	if items[1].OutputTokens != 0 {
+		t.Errorf("items[1].OutputTokens = %d, want 0 (tokens only on first item)", items[1].OutputTokens)
+	}
+}
+
+func TestParseLine_NoUsageInMessage(t *testing.T) {
+	// Test that missing usage data results in 0 tokens
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	if item.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0", item.InputTokens)
+	}
+	if item.OutputTokens != 0 {
+		t.Errorf("OutputTokens = %d, want 0", item.OutputTokens)
+	}
+}
+
+func TestPrettyToolName(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"Bash", "Bash"},
+		{"Read", "Read"},
+		{"Skill", "Skill"},
+		{"mcp__plugin_context7_context7__query-docs", "mcp:query-docs"},
+		{"mcp__context7__resolve", "mcp:resolve"},
+		{"mcp__claude_ai_Gmail__authenticate", "mcp:authenticate"},
+		{"mcp__weird", "mcp__weird"}, // no trailing __method — passthrough
+	}
+	for _, tt := range tests {
+		if got := PrettyToolName(tt.in); got != tt.want {
+			t.Errorf("PrettyToolName(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestParseLine_MCPToolUse_PrettifiesName(t *testing.T) {
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"mcp__plugin_context7_context7__query-docs","input":{"library":"react"}}]}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	if items[0].ToolName != "mcp:query-docs" {
+		t.Errorf("ToolName = %q, want %q", items[0].ToolName, "mcp:query-docs")
+	}
+}
+
+func TestParseLine_CacheTokensInAssistantMessage(t *testing.T) {
+	// cache_creation_input_tokens and cache_read_input_tokens are often much
+	// larger than the naked input_tokens, so undercounting them misleads users.
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":35656,"cache_read_input_tokens":1234}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	if item.CacheCreationTokens != 35656 {
+		t.Errorf("CacheCreationTokens = %d, want 35656", item.CacheCreationTokens)
+	}
+	if item.CacheReadTokens != 1234 {
+		t.Errorf("CacheReadTokens = %d, want 1234", item.CacheReadTokens)
+	}
+	// existing fields still correct
+	if item.InputTokens != 10 || item.OutputTokens != 5 {
+		t.Errorf("Input/Output = %d/%d, want 10/5", item.InputTokens, item.OutputTokens)
+	}
+}
+
+func TestParseLine_UserMessageHasNoTokens(t *testing.T) {
+	// User messages should never have token data (they are not in the Anthropic API response)
+	line := `{"type":"user","timestamp":"2025-01-01T12:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"result data"}],"usage":{"input_tokens":999,"output_tokens":999}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item, got %d", len(items))
+	}
+	item := items[0]
+	// Even if usage is in the JSON, it should be ignored for user messages
+	if item.InputTokens != 0 {
+		t.Errorf("InputTokens = %d, want 0 (user messages don't have usage)", item.InputTokens)
+	}
+	if item.OutputTokens != 0 {
+		t.Errorf("OutputTokens = %d, want 0 (user messages don't have usage)", item.OutputTokens)
+	}
+}
+
+func TestParseLine_CacheMiss_ToolsChanged(t *testing.T) {
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":6,"output_tokens":5,"cache_creation_input_tokens":58861},"diagnostics":{"cache_miss_reason":{"type":"tools_changed","cache_missed_input_tokens":51402}}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected text + cache_miss item, got %d", len(items))
+	}
+	if items[0].Type != TypeText {
+		t.Errorf("items[0].Type = %q, want %q", items[0].Type, TypeText)
+	}
+	if items[1].Type != TypeCacheMiss {
+		t.Errorf("items[1].Type = %q, want %q", items[1].Type, TypeCacheMiss)
+	}
+	if items[1].Content != "tools_changed, +51k tokens" {
+		t.Errorf("content = %q, want %q", items[1].Content, "tools_changed, +51k tokens")
+	}
+}
+
+func TestParseLine_CacheMiss_PreviousMessageNotFound_NoTokens(t *testing.T) {
+	// previous_message_not_found sometimes lacks cache_missed_input_tokens —
+	// detail should reduce to the bare reason string.
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"diagnostics":{"cache_miss_reason":{"type":"previous_message_not_found"}}}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 2 || items[1].Type != TypeCacheMiss {
+		t.Fatalf("expected text + cache_miss, got %+v", items)
+	}
+	if items[1].Content != "previous_message_not_found" {
+		t.Errorf("content = %q, want %q", items[1].Content, "previous_message_not_found")
+	}
+}
+
+func TestParseLine_CacheMiss_NullDiagnosticsSkipped(t *testing.T) {
+	// diagnostics:null (the default on healthy assistant messages) must not
+	// emit a cache-miss marker.
+	line := `{"type":"assistant","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","message":{"role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1},"diagnostics":null}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 item (no cache_miss), got %d", len(items))
+	}
+	if items[0].Type != TypeText {
+		t.Errorf("type = %q, want text", items[0].Type)
+	}
+}
+
+func TestParseLine_QueueOperation_Enqueue(t *testing.T) {
+	line := `{"type":"queue-operation","operation":"enqueue","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","content":"then do a review"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session_event, got %+v", items)
+	}
+	if items[0].ToolName != "queued" {
+		t.Errorf("label = %q, want queued", items[0].ToolName)
+	}
+	if items[0].Content != "then do a review" {
+		t.Errorf("content = %q", items[0].Content)
+	}
+}
+
+func TestParseLine_QueueOperation_Remove(t *testing.T) {
+	line := `{"type":"queue-operation","operation":"remove","timestamp":"2025-01-01T12:00:00Z","sessionId":"s"}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].ToolName != "dequeued" {
+		t.Fatalf("expected 1 dequeued event, got %+v", items)
+	}
+	if items[0].Content != "" {
+		t.Errorf("dequeue should have empty content, got %q", items[0].Content)
+	}
+}
+
+func TestParseLine_QueueOperation_TaskNotificationDropped(t *testing.T) {
+	// task-notification re-injections show up as queue-operation enqueues
+	// but aren't user-typed prompts — drop them.
+	line := `{"type":"queue-operation","operation":"enqueue","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","content":"<task-notification>\n<task-id>x</task-id>\n</task-notification>"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestParseLine_PlanModeExit_Saved(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"plan_mode_exit","planFilePath":"/p.md","planExists":true}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].ToolName != "plan mode exit" {
+		t.Fatalf("expected plan mode exit, got %+v", items)
+	}
+	if items[0].Content != "saved" {
+		t.Errorf("content = %q, want saved", items[0].Content)
+	}
+}
+
+func TestParseLine_PlanModeExit_Unsaved(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"plan_mode_exit","planExists":false}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Content != "" {
+		t.Fatalf("expected empty content for unsaved plan exit, got %+v", items)
+	}
+}
+
+func TestParseLine_AutoMode(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"auto_mode"}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].ToolName != "auto mode" {
+		t.Fatalf("expected auto mode event, got %+v", items)
+	}
+}
+
+func TestParseLine_DeferredToolsDelta(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"deferred_tools_delta","addedNames":["A","B","C"],"removedNames":["D"]}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].ToolName != "tools" {
+		t.Fatalf("expected tools delta event, got %+v", items)
+	}
+	if items[0].Content != "+3 -1" {
+		t.Errorf("content = %q, want %q", items[0].Content, "+3 -1")
+	}
+}
+
+func TestParseLine_DeferredToolsDelta_EmptyDropped(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"deferred_tools_delta","addedNames":[],"removedNames":[]}}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items for empty delta, got %+v", items)
+	}
+}
+
+func TestParseLine_MCPInstructionsDelta(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"mcp_instructions_delta","addedNames":["plugin:context7:context7"]}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].ToolName != "MCP" {
+		t.Fatalf("expected MCP delta event, got %+v", items)
+	}
+	if items[0].Content != "+1" {
+		t.Errorf("content = %q, want %q", items[0].Content, "+1")
+	}
+}
+
+func TestParseLine_SkillListing_InitialDropped(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"skill_listing","skillCount":49,"isInitial":true}}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items for initial skill listing, got %+v", items)
+	}
+}
+
+func TestParseLine_SkillListing_UpdateSurfaces(t *testing.T) {
+	line := `{"type":"attachment","timestamp":"2025-01-01T12:00:00Z","sessionId":"s","attachment":{"type":"skill_listing","skillCount":50,"isInitial":false}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].ToolName != "skills" {
+		t.Fatalf("expected skills event, got %+v", items)
+	}
+	if items[0].Content != "50 total" {
+		t.Errorf("content = %q, want %q", items[0].Content, "50 total")
+	}
+}
+
+func TestParseLine_SessionTitleAITitle(t *testing.T) {
+	// Claude Code renamed agent-name → ai-title; the new lines carry the
+	// label in aiTitle and have no timestamp field.
+	line := `{"type":"ai-title","aiTitle":"Understand pat search functionality","sessionId":"sess-3"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 title item, got %d", len(items))
+	}
+	if items[0].Type != TypeSessionTitle {
+		t.Errorf("type = %q, want %q", items[0].Type, TypeSessionTitle)
+	}
+	if items[0].Content != "Understand pat search functionality" {
+		t.Errorf("content = %q", items[0].Content)
+	}
+	if items[0].SessionID != "sess-3" {
+		t.Errorf("sessionID = %q, want sess-3", items[0].SessionID)
+	}
+}
+
+func TestParseLine_AITitleEmptyDropped(t *testing.T) {
+	line := `{"type":"ai-title","aiTitle":"","sessionId":"sess-3"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items for empty ai-title, got %+v", items)
+	}
+}
+
+func TestParseLine_PermissionMode(t *testing.T) {
+	line := `{"type":"permission-mode","permissionMode":"auto","sessionId":"s"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "permission mode" || items[0].Content != "auto" {
+		t.Errorf("got label=%q detail=%q, want permission mode/auto", items[0].ToolName, items[0].Content)
+	}
+}
+
+func TestParseLine_APIError(t *testing.T) {
+	line := `{"type":"system","subtype":"api_error","sessionId":"s","timestamp":"2026-06-01T12:00:00Z","error":{"message":"529 overloaded_error","status":529,"formatted":"529 Overloaded"},"retryInMs":559.6,"retryAttempt":1,"maxRetries":10}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeAPIError {
+		t.Fatalf("expected 1 api_error item, got %+v", items)
+	}
+	if items[0].Content != "529 Overloaded, retry 1/10" {
+		t.Errorf("content = %q, want %q", items[0].Content, "529 Overloaded, retry 1/10")
+	}
+}
+
+func TestParseLine_APIError_MessageFallback(t *testing.T) {
+	line := `{"type":"system","subtype":"api_error","sessionId":"s","timestamp":"2026-06-01T12:00:00Z","error":{"message":"connection reset"}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Content != "connection reset" {
+		t.Fatalf("expected message fallback, got %+v", items)
+	}
+}
+
+func TestParseLine_AwaySummary(t *testing.T) {
+	line := `{"type":"system","subtype":"away_summary","sessionId":"s","timestamp":"2026-06-01T12:00:00Z","content":"Built the thing. Next: ship it."}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "recap" || items[0].Content != "Built the thing. Next: ship it." {
+		t.Errorf("got label=%q detail=%q", items[0].ToolName, items[0].Content)
+	}
+}
+
+func TestParseLine_AwaySummary_EmptyDropped(t *testing.T) {
+	line := `{"type":"system","subtype":"away_summary","sessionId":"s","timestamp":"2026-06-01T12:00:00Z"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestParseLine_LocalCommand(t *testing.T) {
+	line := `{"type":"system","subtype":"local_command","sessionId":"s","timestamp":"2026-07-18T17:03:31Z","content":"<command-name>/skills</command-name>\n            <command-message>skills</command-message>\n            <command-args></command-args>"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "command" || items[0].Content != "/skills" {
+		t.Errorf("got label=%q detail=%q", items[0].ToolName, items[0].Content)
+	}
+}
+
+func TestParseLine_LocalCommand_WithArgs(t *testing.T) {
+	line := `{"type":"system","subtype":"local_command","sessionId":"s","timestamp":"2026-07-18T17:03:31Z","content":"<command-name>/loop</command-name><command-args>5m check ci</command-args>"}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Content != "/loop 5m check ci" {
+		t.Fatalf("got %+v", items)
+	}
+}
+
+func TestParseLine_LocalCommand_NoNameDropped(t *testing.T) {
+	line := `{"type":"system","subtype":"local_command","sessionId":"s","timestamp":"2026-07-18T17:03:31Z","content":"no tags here"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestParseLine_Informational(t *testing.T) {
+	tests := []struct {
+		level string
+		want  string
+	}{
+		{"warning", "warning"},
+		{"info", "note"},
+		{"", "note"},
+	}
+	for _, tt := range tests {
+		line := `{"type":"system","subtype":"informational","sessionId":"s","timestamp":"2026-08-03T13:34:23Z","content":"Backgrounding after the current tool finishes","level":"` + tt.level + `"}`
+		items, err := ParseLine(line)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(items) != 1 || items[0].Type != TypeSessionEvent {
+			t.Fatalf("level %q: expected 1 session event, got %+v", tt.level, items)
+		}
+		if items[0].ToolName != tt.want {
+			t.Errorf("level %q: got label=%q, want %q", tt.level, items[0].ToolName, tt.want)
+		}
+		if items[0].Content != "Backgrounding after the current tool finishes" {
+			t.Errorf("level %q: got detail=%q", tt.level, items[0].Content)
+		}
+	}
+}
+
+func TestParseLine_Informational_EmptyDropped(t *testing.T) {
+	line := `{"type":"system","subtype":"informational","sessionId":"s","timestamp":"2026-08-03T13:34:23Z","level":"warning"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestParseLine_AgentsKilled(t *testing.T) {
+	line := `{"type":"system","subtype":"agents_killed","sessionId":"s","timestamp":"2026-08-01T15:22:11Z"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "agents killed" {
+		t.Errorf("got label=%q", items[0].ToolName)
+	}
+}
+
+func TestContextWindowFor(t *testing.T) {
+	tests := []struct {
+		model string
+		want  int64
+	}{
+		{"claude-fable-5", 1_000_000},
+		{"claude-mythos-5", 1_000_000},
+		{"claude-opus-5", 1_000_000},
+		{"claude-sonnet-5", 1_000_000},
+		{"claude-opus-4-8", 1_000_000},
+		{"claude-opus-4-7", 1_000_000},
+		{"claude-opus-4-6", 1_000_000},
+		{"claude-sonnet-4-6", 1_000_000},
+		{"claude-haiku-4-5-20251001", 200_000},
+		{"claude-sonnet-4-5", 200_000},
+		{"some-unknown-model", 200_000},
+	}
+	for _, tt := range tests {
+		if got := ContextWindowFor(tt.model); got != tt.want {
+			t.Errorf("ContextWindowFor(%q) = %d, want %d", tt.model, got, tt.want)
+		}
+	}
+}
+
+func TestDebugPreviewCJKNeverSplitsRune(t *testing.T) {
+	old := DebugAll
+	DebugAll = true
+	defer func() { DebugAll = old }()
+
+	// Claude Code writes non-ASCII to the transcript unescaped, so a
+	// multi-byte character can straddle the preview cut. Sweep the pad length
+	// so the boundary lands inside a rune from every offset.
+	for pad := 0; pad < 16; pad++ {
+		line := fmt.Sprintf(
+			`{"type":"file-history-snapshot","sessionId":"s","timestamp":"2025-01-01T12:00:00Z","note":"%s%s"}`,
+			strings.Repeat("x", pad),
+			strings.Repeat("測試中文", 30),
+		)
+		items, err := ParseLine(line)
+		if err != nil {
+			t.Fatalf("pad %d: %v", pad, err)
+		}
+		if len(items) != 1 {
+			t.Fatalf("pad %d: got %d items, want 1", pad, len(items))
+		}
+		if !utf8.ValidString(items[0].Content) {
+			t.Errorf("pad %d: preview is not valid UTF-8: %q", pad, items[0].Content)
+		}
+		if !strings.HasSuffix(items[0].Content, "…") {
+			t.Errorf("pad %d: want a trailing ellipsis, got %q", pad, items[0].Content)
+		}
+	}
+}
+
+// --- v0.12.0: frame-link, continued-in, cost-state, task_status ---
+
+func TestParseLine_FrameLink(t *testing.T) {
+	line := `{"type":"frame-link","sessionId":"4f9aca60","path":"/tmp/scratch/marblemath.html","frameUrl":"https://claude.ai/code/artifact/d9254fd4-fadd-49af-a025-b168723f9530","title":"MarbleMath","artifactCount":1,"timestamp":"2026-08-23T21:59:11.397Z"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeArtifactLink {
+		t.Fatalf("expected 1 artifact_link item, got %+v", items)
+	}
+	want := `artifact "MarbleMath" → https://claude.ai/code/artifact/d9254fd4-fadd-49af-a025-b168723f9530`
+	if items[0].Content != want {
+		t.Errorf("content = %q, want %q", items[0].Content, want)
+	}
+	if items[0].SessionID != "4f9aca60" {
+		t.Errorf("sessionID = %q", items[0].SessionID)
+	}
+}
+
+func TestParseLine_FrameLink_NoTitle(t *testing.T) {
+	line := `{"type":"frame-link","sessionId":"s","frameUrl":"https://claude.ai/code/artifact/abc","artifactCount":1,"timestamp":"2026-08-23T21:59:11.397Z"}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Content != "artifact → https://claude.ai/code/artifact/abc" {
+		t.Fatalf("got %+v", items)
+	}
+}
+
+func TestParseLine_FrameLink_CountOnlyDropped(t *testing.T) {
+	// Redeploys and watch bookkeeping re-emit frame-link with only a count.
+	line := `{"type":"frame-link","artifactCount":1,"sessionId":"s","timestamp":"2026-08-23T22:06:10.001Z"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestParseLine_FrameLink_CountOnlyDebug(t *testing.T) {
+	prev := DebugAll
+	DebugAll = true
+	t.Cleanup(func() { DebugAll = prev })
+
+	line := `{"type":"frame-link","artifactCount":1,"sessionId":"s","timestamp":"2026-08-23T22:06:10.001Z"}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Type != TypeDebug || items[0].ToolName != "frame-link" {
+		t.Fatalf("expected 1 debug item labelled frame-link, got %+v", items)
+	}
+}
+
+func TestParseLine_ContinuedIn(t *testing.T) {
+	line := `{"type":"continued-in","timestamp":"2026-09-04T21:38:04.469Z","sessionId":"d2bf19dc","continuedInSessionId":"6ee341a1-87cb-4157-a678-ceafb0bd48c6"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "continued in" || items[0].Content != "6ee341a1-87cb-4157-a678-ceafb0bd48c6" {
+		t.Errorf("got label=%q detail=%q", items[0].ToolName, items[0].Content)
+	}
+}
+
+func TestParseLine_ContinuedIn_EmptyDropped(t *testing.T) {
+	line := `{"type":"continued-in","timestamp":"2026-09-04T21:38:04.469Z","sessionId":"d2bf19dc"}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestParseLine_CostState(t *testing.T) {
+	// Real shape: no timestamp field; startTime + totalDuration (ms) locate it.
+	line := `{"type":"cost-state","sessionId":"0e1f948f","totalCostUSD":13.749958700000004,"totalAPIDuration":1397557,"totalAPIDurationWithoutRetries":1397291,"totalToolDuration":850473,"totalLinesAdded":1003,"totalLinesRemoved":168,"totalDuration":58855298,"startTime":1788522122378,"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":45592,"outputTokens":712,"costUSD":0.049152},"claude-sonnet-5":{"inputTokens":6294,"outputTokens":96305,"costUSD":1.2},"claude-opus-5":{"inputTokens":5499,"outputTokens":203056,"costUSD":12.5}},"hasUnknownModelCost":false}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "session cost" {
+		t.Errorf("label = %q", items[0].ToolName)
+	}
+	want := "$13.75 · +1003/-168 lines · opus-5 sonnet-5 haiku-4-5"
+	if items[0].Content != want {
+		t.Errorf("detail = %q, want %q", items[0].Content, want)
+	}
+	wantTS := time.UnixMilli(1788522122378 + 58855298)
+	if !items[0].Timestamp.Equal(wantTS) {
+		t.Errorf("timestamp = %v, want %v", items[0].Timestamp, wantTS)
+	}
+}
+
+func TestParseLine_CostState_NoLines(t *testing.T) {
+	line := `{"type":"cost-state","sessionId":"s","totalCostUSD":1.2836649999999998,"totalLinesAdded":0,"totalLinesRemoved":0,"totalDuration":95160,"startTime":1788264806385,"modelUsage":{"claude-opus-5":{"costUSD":1.28}}}`
+	items, _ := ParseLine(line)
+	if len(items) != 1 || items[0].Content != "$1.28 · opus-5" {
+		t.Fatalf("got %+v", items)
+	}
+}
+
+func TestParseLine_CostState_EmptyDropped(t *testing.T) {
+	line := `{"type":"cost-state","sessionId":"s","totalCostUSD":0,"modelUsage":{}}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+func TestShortModelName(t *testing.T) {
+	tests := map[string]string{
+		"claude-haiku-4-5-20251001": "haiku-4-5",
+		"claude-opus-5":             "opus-5",
+		"claude-fable-5-1":          "fable-5-1",
+		"claude-sonnet-4-5":         "sonnet-4-5",
+		"gpt-4o":                    "gpt-4o",
+	}
+	for in, want := range tests {
+		if got := shortModelName(in); got != want {
+			t.Errorf("shortModelName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestParseLine_TaskStatus(t *testing.T) {
+	line := `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"task_status","taskId":"a9c1d0bd1b5243cd3","taskType":"local_agent","description":"Brainstorm next steps for Towerstakes","status":"running","deltaSummary":"Comparing rush pacing in econ/rush.go","outputFilePath":"/tmp/x.output"}}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "task running" {
+		t.Errorf("label = %q", items[0].ToolName)
+	}
+	want := "Brainstorm next steps for Towerstakes — Comparing rush pacing in econ/rush.go"
+	if items[0].Content != want {
+		t.Errorf("detail = %q, want %q", items[0].Content, want)
+	}
+}
+
+func TestParseLine_TaskStatus_EmptyDropped(t *testing.T) {
+	line := `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"task_status","taskId":"x","status":"running"}}`
+	items, _ := ParseLine(line)
+	if len(items) != 0 {
+		t.Fatalf("expected 0 items, got %+v", items)
+	}
+}
+
+// TestParseLine_NewNoiseTypesDropped pins the deliberate-drop list for line
+// types introduced in Claude Code 2.1.235–2.1.261. These are high-volume
+// bookkeeping (atis-latch alone is ~2k lines per 90 sessions) and must stay
+// out of the stream without DebugAll.
+func TestParseLine_NewNoiseTypesDropped(t *testing.T) {
+	lines := map[string]string{
+		"atis-latch":                `{"type":"atis-latch","atis":"","sessionId":"s"}`,
+		"artifact-autoreact-ledger": `{"type":"artifact-autoreact-ledger","v":1,"sessionId":"s","artifacts":{}}`,
+		"artifact-comment-monitor":  `{"type":"artifact-comment-monitor","v":1,"sessionId":"s","artifacts":{}}`,
+		"bash_output_audience_note": `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"bash_output_audience_note","toolUseID":"toolu_01"}}`,
+		"batching_reminder_sent":    `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"batching_reminder_sent","text":"...","model":"claude-fable-5"}}`,
+		"silent_turn_reminder":      `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"silent_turn_reminder","text":"..."}}`,
+		"remote_session_change":     `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"remote_session_change","url":null,"commit":"Co-Authored-By: x","pr":"y","sendUserFileHint":true}}`,
+		"plan_mode":                 `{"type":"attachment","sessionId":"s","timestamp":"2026-08-30T10:00:00Z","attachment":{"type":"plan_mode","reminderType":"full","isSubAgent":false,"planFilePath":"/x.md","planExists":false}}`,
+	}
+	for name, line := range lines {
+		t.Run(name, func(t *testing.T) {
+			items, err := ParseLine(line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 0 {
+				t.Fatalf("expected 0 items, got %+v", items)
+			}
+		})
+	}
+}
+
+func TestFormatToolInput_NewTools(t *testing.T) {
+	tests := []struct {
+		name  string
+		tool  string
+		input string
+		want  string
+	}{
+		{"SendUserFile with caption", "SendUserFile", `{"files":["/tmp/a/review_before.png","/tmp/a/review_poses.png"],"status":"normal","caption":"Before and after"}`, "review_before.png, review_poses.png\n  # Before and after"},
+		{"SendUserFile no caption", "SendUserFile", `{"files":["/tmp/a/x.png"]}`, "x.png"},
+		{"SendUserFile caption only", "SendUserFile", `{"caption":"hi"}`, "hi"},
+		{"AskUserQuestion", "AskUserQuestion", `{"questions":[{"question":"What scope?","header":"Scope","options":[]},{"question":"Which lib?","header":"Lib"}]}`, "What scope?\nWhich lib?"},
+		{"AskUserQuestion empty falls back", "AskUserQuestion", `{"questions":[]}`, `{"questions":[]}`},
+		{"Monitor", "Monitor", `{"command":"tail -f x.log","description":"watch the log","timeout_ms":3000}`, "tail -f x.log\n  # watch the log"},
+		{"Monitor no description", "Monitor", `{"command":"tail -f x.log"}`, "tail -f x.log"},
+		{"SendMessage", "SendMessage", `{"to":"a3b166f9","message":"Nice work"}`, "→ a3b166f9: Nice work"},
+		{"SendMessage no recipient", "SendMessage", `{"message":"Nice work"}`, "Nice work"},
+		{"ListAgents", "ListAgents", `{}`, "(list agents)"},
+		{"Artifact publish", "Artifact", `{"file_path":"/tmp/s/marblemath.html","favicon":"🔵","description":"Design doc"}`, "publish /tmp/s/marblemath.html"},
+		{"Artifact redeploy to url", "Artifact", `{"file_path":"/tmp/s/m.html","url":"https://claude.ai/code/artifact/abc"}`, "publish /tmp/s/m.html → https://claude.ai/code/artifact/abc"},
+		{"Artifact read", "Artifact", `{"action":"read","url":"https://claude.ai/code/artifact/abc"}`, "read https://claude.ai/code/artifact/abc"},
+		{"Artifact list", "Artifact", `{"action":"list"}`, "list"},
+		{"SubagentHandback", "SubagentHandback", `{"message":"## Unison: report\n\nAll 6 snippets pass."}`, "## Unison: report\n\nAll 6 snippets pass."},
+		{"CronDelete", "CronDelete", `{"id":"0d4716b9"}`, "cron 0d4716b9"},
+		{"SendFeedback", "SendFeedback", `{"type":"bug","title":"Picker needs a mouse","details":"- **What happened:** ..."}`, "Picker needs a mouse"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatToolInput(tc.tool, json.RawMessage(tc.input))
+			if got != tc.want {
+				t.Errorf("formatToolInput(%s) = %q, want %q", tc.tool, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseLine_HookAttachments(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		hookName string
+		want     string
+	}{
+		{
+			"additional context",
+			`{"type":"attachment","timestamp":"2026-09-19T22:45:11Z","sessionId":"s","attachment":{"type":"hook_additional_context","content":["first note","second note"],"hookName":"UserPromptSubmit","toolUseID":"hook-1","hookEvent":"UserPromptSubmit"}}`,
+			"UserPromptSubmit",
+			"first note\nsecond note",
+		},
+		{
+			"blocking error",
+			`{"type":"attachment","timestamp":"2026-09-19T22:41:11Z","sessionId":"s","attachment":{"type":"hook_blocking_error","hookName":"Stop","toolUseID":"t","hookEvent":"Stop","blockingError":{"blockingError":"no test ran after the last edit","command":"check claims"}}}`,
+			"Stop",
+			"blocked: no test ran after the last edit",
+		},
+		{
+			"non-blocking error",
+			`{"type":"attachment","timestamp":"2026-09-19T22:22:45Z","sessionId":"s","attachment":{"type":"hook_non_blocking_error","hookName":"PreToolUse:Write","toolUseID":"t","hookEvent":"PreToolUse","stderr":"ENOENT: no such file\n","stdout":"","exitCode":1,"command":"check edit","durationMs":7}}`,
+			"PreToolUse:Write",
+			"error (exit 1): ENOENT: no such file",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := ParseLine(tc.line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 1 || items[0].Type != TypeHookOutput {
+				t.Fatalf("expected 1 hook item, got %+v", items)
+			}
+			if items[0].ToolName != tc.hookName {
+				t.Errorf("toolName = %q, want %q", items[0].ToolName, tc.hookName)
+			}
+			if items[0].Content != tc.want {
+				t.Errorf("content = %q, want %q", items[0].Content, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseLine_HookAttachments_EmptyDropped(t *testing.T) {
+	lines := []string{
+		`{"type":"attachment","timestamp":"2026-09-19T22:45:11Z","sessionId":"s","attachment":{"type":"hook_additional_context","content":[],"hookName":"UserPromptSubmit"}}`,
+		`{"type":"attachment","timestamp":"2026-09-19T22:41:11Z","sessionId":"s","attachment":{"type":"hook_blocking_error","hookName":"Stop","blockingError":{"blockingError":""}}}`,
+	}
+	for _, line := range lines {
+		items, _ := ParseLine(line)
+		if len(items) != 0 {
+			t.Errorf("expected 0 items, got %+v for %s", items, line)
+		}
+	}
+}
+
+func TestParseLine_ModelRefusal(t *testing.T) {
+	line := `{"type":"system","subtype":"model_refusal_no_fallback","content":"","level":"warning","originalModel":"claude-opus-5[1m]","requestId":"req_1","apiRefusalCategory":"cyber","apiRefusalExplanation":"blocked","isMeta":false,"timestamp":"2026-09-15T12:34:01Z","sessionId":"s"}`
+	items, err := ParseLine(line)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].Type != TypeSessionEvent {
+		t.Fatalf("expected 1 session event, got %+v", items)
+	}
+	if items[0].ToolName != "refused" || items[0].Content != "cyber (opus-5[1m])" {
+		t.Errorf("got label=%q detail=%q", items[0].ToolName, items[0].Content)
+	}
+}
+
+func TestParseLine_ScheduledTaskFire(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want string
+	}{
+		{"cron and prompt", `{"type":"system","subtype":"scheduled_task_fire","content":"Running scheduled task (Sep 22 8:10am)","timestamp":"2026-09-22T12:10:57Z","sessionId":"s","taskId":"0d4716b9","cron":"*/5 * * * *","prompt":"check the deploy"}`, "*/5 * * * *: check the deploy"},
+		{"content fallback", `{"type":"system","subtype":"scheduled_task_fire","content":"Running scheduled task (Sep 22 8:10am)","timestamp":"2026-09-22T12:10:57Z","sessionId":"s"}`, "Running scheduled task (Sep 22 8:10am)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			items, err := ParseLine(tc.line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 1 || items[0].Type != TypeSessionEvent || items[0].ToolName != "scheduled task" {
+				t.Fatalf("expected 1 scheduled task event, got %+v", items)
+			}
+			if items[0].Content != tc.want {
+				t.Errorf("detail = %q, want %q", items[0].Content, tc.want)
+			}
+		})
+	}
+}
+
+// Session-start echoes, cache telemetry and per-stop hook summaries are
+// deliberately left dropped.
+func TestParseLine_V013Dropped(t *testing.T) {
+	lines := map[string]string{
+		"date":                  `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"date","date":"2026-09-13"}}`,
+		"environment":           `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"environment","snapshot":{"workingDirectory":"/x"}}}`,
+		"instructions":          `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"instructions","files":[{"path":"/x/CLAUDE.md","type":"Project","content":"# X"}]}}`,
+		"model":                 `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"model","identity":{"modelId":"claude-opus-5[1m]"},"text":"You are powered by Opus 5."}}`,
+		"session_context":       `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"session_context","context":{"gitStatus":"clean"}}}`,
+		"prompt_snapshot":       `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"prompt_snapshot","systemPrompt":["You are an agent"]}}`,
+		"deferred_tools_record": `{"type":"attachment","timestamp":"2026-09-13T17:11:58Z","sessionId":"s","attachment":{"type":"deferred_tools_record","entries":[{"name":"WebFetch"}]}}`,
+		"thinking_stripped":     `{"type":"attachment","timestamp":"2026-09-12T13:53:43Z","sessionId":"s","attachment":{"type":"thinking_stripped","scope":"all"}}`,
+		"thinking_drop":         `{"type":"attachment","timestamp":"2026-09-18T00:49:32Z","sessionId":"s","attachment":{"type":"thinking_drop","model":"claude-fable-5-1","thinkingBlocksSent":14}}`,
+		"opened_file_in_ide":    `{"type":"attachment","timestamp":"2026-09-18T00:46:11Z","sessionId":"s","attachment":{"type":"opened_file_in_ide","filename":"/x/cpu.rs"}}`,
+		"stop_hook_summary":     `{"type":"system","subtype":"stop_hook_summary","hookCount":1,"hookInfos":[{"command":"c","durationMs":561}],"hookErrors":[],"preventedContinuation":false,"level":"suggestion","timestamp":"2026-09-19T22:30:48Z","sessionId":"s"}`,
+		"fork-context-ref":      `{"type":"fork-context-ref","agentId":"af476ef8d89ec8227","parentSessionId":"p","parentLastUuid":"u","contextLength":82}`,
+	}
+	for name, line := range lines {
+		t.Run(name, func(t *testing.T) {
+			items, err := ParseLine(line)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 0 {
+				t.Fatalf("expected 0 items, got %+v", items)
+			}
+		})
+	}
 }

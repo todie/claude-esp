@@ -1,6 +1,11 @@
 package tui
 
-import "github.com/charmbracelet/lipgloss"
+import (
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/mattn/go-runewidth"
+)
 
 var (
 	// Colors
@@ -40,6 +45,30 @@ var (
 	textStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#F9FAFB"))
 
+	// Hook style - cyan (system-injected output, distinct from tool calls)
+	hookIcon  = "🪝"
+	hookStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#06B6D4")).
+			Bold(true)
+	hookContentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#67E8F9"))
+
+	// Diagnostics style - red-ish (LSP findings after edits)
+	diagnosticsIcon  = "⚠"
+	diagnosticsStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#F87171")).
+				Bold(true)
+	diagnosticsContentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#FCA5A5"))
+
+	// Debug style - dim grey/orange, used for -D flag
+	debugIcon  = "🔍"
+	debugStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#9CA3AF")).
+			Bold(true)
+	debugContentStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#9CA3AF"))
+
 	// Agent name styles
 	mainAgentStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#60A5FA")).
@@ -55,10 +84,6 @@ var (
 				Bold(true)
 	treeNormalStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#D1D5DB"))
-	treeCheckedStyle = lipgloss.NewStyle().
-				Foreground(secondaryColor)
-	treeUncheckedStyle = lipgloss.NewStyle().
-				Foreground(mutedColor)
 
 	// Border styles
 	treeBorderStyle = lipgloss.NewStyle().
@@ -102,15 +127,40 @@ var (
 	// Muted text style (for truncation messages etc)
 	mutedStyle = lipgloss.NewStyle().
 			Foreground(mutedColor)
+
+	// API error marker - red, so failed/retrying requests stand out
+	apiErrorStyle = lipgloss.NewStyle().
+			Foreground(errorColor)
 )
 
-// Helper to truncate strings
-func truncate(s string, max int) string {
-	if len(s) <= max {
+// Truncate shortens s to max terminal columns, adding "..." if it was cut.
+//
+// Width is measured with go-runewidth -- the same basis the stream pane uses
+// for wrapping -- and cuts always land on a rune boundary, so multi-byte text
+// such as CJK session titles is never split mid-character. The byte slicing
+// this replaces both mis-measured such text as over-long and cut it into
+// invalid UTF-8.
+func Truncate(s string, max int) string {
+	if runewidth.StringWidth(s) <= max {
 		return s
 	}
-	if max <= 3 {
-		return s[:max]
+	ellipsis := max > 3
+	budget := max
+	if ellipsis {
+		budget = max - 3
 	}
-	return s[:max-3] + "..."
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := runewidth.RuneWidth(r)
+		if used+w > budget {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	if ellipsis {
+		b.WriteString("...")
+	}
+	return b.String()
 }

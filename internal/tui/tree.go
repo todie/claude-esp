@@ -3,6 +3,8 @@ package tui
 import (
 	"fmt"
 	"strings"
+
+	"github.com/charmbracelet/x/ansi"
 )
 
 // NodeType indicates the type of tree node
@@ -36,6 +38,20 @@ type TreeNode struct {
 	ParentAgentID string // which agent spawned this task (empty = main)
 	OutputPath    string // path to tool-results file
 	IsComplete    bool   // whether the task has finished
+
+	// Per-agent context size (Main/Agent nodes only). ContextTokens is the
+	// most recent input+cache_creation+cache_read snapshot for this agent;
+	// ContextWindow is the model's max context window in tokens. Both are
+	// zero until at least one assistant message with usage info has arrived.
+	ContextTokens int64
+	ContextWindow int64
+
+	// Session-only collapse state (used by -c / auto-collapse feature).
+	// Collapsed: children are hidden from tree navigation and stream filtering.
+	// Pinned: user manually expanded this session; suppress auto-collapse until
+	// the session wakes up again.
+	Collapsed bool
+	Pinned    bool
 }
 
 // TreeView manages the tree of sessions and agents
@@ -76,9 +92,7 @@ func (t *TreeView) AddSession(sessionID, projectPath string) *TreeNode {
 	if len(parts) > 2 {
 		displayName = parts[len(parts)-1]
 	}
-	if len(displayName) > 15 {
-		displayName = displayName[:15]
-	}
+	displayName = Truncate(displayName, 15)
 
 	session := &TreeNode{
 		Type:     NodeTypeSession,
@@ -194,9 +208,7 @@ func (t *TreeView) AddBackgroundTask(sessionID, parentAgentID, toolID, toolName,
 
 	// Truncate tool name for display
 	displayName := toolName
-	if len(displayName) > 25 {
-		displayName = displayName[:25] + "..."
-	}
+	displayName = Truncate(displayName, 25)
 
 	node := &TreeNode{
 		Type:          NodeTypeBackgroundTask,
@@ -254,6 +266,11 @@ func (t *TreeView) rebuildNodeList() {
 
 func (t *TreeView) flattenNode(node *TreeNode, depth int) {
 	t.nodes = append(t.nodes, node)
+	// Collapsed sessions hide their children from navigation AND from the
+	// stream's enabled-filter set (GetEnabledFilters walks t.nodes).
+	if node.Type == NodeTypeSession && node.Collapsed {
+		return
+	}
 	for _, child := range node.Children {
 		t.flattenNode(child, depth+1)
 	}
@@ -273,23 +290,36 @@ func (t *TreeView) MoveDown() {
 	}
 }
 
-// Toggle toggles the enabled state of current node
+// Toggle toggles the current node's visibility.
+//
+// On a session node, space collapses/expands (hides children in the tree and
+// filters them from the stream). Manually expanding pins the session so
+// auto-collapse won't re-collapse it until the session wakes again.
+//
+// On Main/Agent/BackgroundTask nodes, space toggles the node's enabled state
+// (shows/hides that specific agent's output).
 func (t *TreeView) Toggle() {
-	if t.cursor >= 0 && t.cursor < len(t.nodes) {
-		node := t.nodes[t.cursor]
-		node.Enabled = !node.Enabled
-
-		// If toggling a session, toggle all children too
-		if node.Type == NodeTypeSession {
-			for _, child := range node.Children {
-				child.Enabled = node.Enabled
-			}
-		}
+	if t.cursor < 0 || t.cursor >= len(t.nodes) {
+		return
 	}
+	node := t.nodes[t.cursor]
+	if node.Type == NodeTypeSession {
+		node.Collapsed = !node.Collapsed
+		if !node.Collapsed {
+			node.Pinned = true
+		}
+		t.rebuildNodeList()
+		return
+	}
+	node.Enabled = !node.Enabled
 }
 
 // Solo isolates the selected node: disables all others, enables only this one.
 // If already soloed, re-enables all.
+//
+// If the target is a collapsed session, Solo force-expands it first (and
+// pins) — the whole point of soloing is to see that session's output, which
+// means its children must be visible in the tree and routed to the stream.
 func (t *TreeView) Solo() {
 	if t.cursor < 0 || t.cursor >= len(t.nodes) {
 		return
@@ -303,6 +333,14 @@ func (t *TreeView) Solo() {
 		// Disable all sessions and their children
 		for _, session := range t.Root.Children {
 			setAllEnabled(session, false)
+		}
+
+		// If soloing onto a collapsed session, expand it first so its
+		// children can be enabled and shown in the stream.
+		if selected.Type == NodeTypeSession && selected.Collapsed {
+			selected.Collapsed = false
+			selected.Pinned = true
+			defer t.rebuildNodeList()
 		}
 
 		// Enable the selected node and the path to it
@@ -364,6 +402,79 @@ func (t *TreeView) GetSelectedSession() string {
 	return ""
 }
 
+// SetCollapsed updates a session's collapse state. When collapsing, if the
+// cursor was pointing at a now-hidden child, it jumps up to the session row
+// so the user doesn't lose their position entirely. Setting collapsed=false
+// does NOT set Pinned — the caller decides (auto-wake vs user Toggle).
+func (t *TreeView) SetCollapsed(sessionID string, collapsed bool) {
+	for _, session := range t.Root.Children {
+		if session.Type != NodeTypeSession || session.ID != sessionID {
+			continue
+		}
+		if session.Collapsed == collapsed {
+			return
+		}
+		cursorNode := t.GetSelectedNode()
+		session.Collapsed = collapsed
+		t.rebuildNodeList()
+		// If the cursor was inside the subtree that just got hidden, move it
+		// up to the session row. Otherwise leave it alone — rebuildNodeList
+		// already clamps it to a valid range.
+		if collapsed && cursorNode != nil && cursorNode != session {
+			if t.nodeInSubtree(cursorNode, session) {
+				for i, n := range t.nodes {
+					if n == session {
+						t.cursor = i
+						break
+					}
+				}
+			}
+		}
+		return
+	}
+}
+
+// SetPinned sets the user-pinned flag on a session. Pinned sessions are
+// exempted from auto-collapse until they next wake up.
+func (t *TreeView) SetPinned(sessionID string, pinned bool) {
+	for _, session := range t.Root.Children {
+		if session.Type == NodeTypeSession && session.ID == sessionID {
+			session.Pinned = pinned
+			return
+		}
+	}
+}
+
+// nodeInSubtree returns true if needle appears anywhere in root's subtree.
+func (t *TreeView) nodeInSubtree(needle, root *TreeNode) bool {
+	if root == needle {
+		return true
+	}
+	for _, c := range root.Children {
+		if t.nodeInSubtree(needle, c) {
+			return true
+		}
+	}
+	return false
+}
+
+// SetSessionTitle updates the display name of a session node. Used when the
+// JSONL stream reports an agent-name or custom-title for the session, giving
+// users a human-readable label instead of the project path. Length is capped
+// so narrow tree panes don't overflow; the raw project name (25 char cap) was
+// the prior default, so we keep the same ceiling here.
+func (t *TreeView) SetSessionTitle(sessionID, title string) {
+	if title == "" {
+		return
+	}
+	for _, child := range t.Root.Children {
+		if child.Type == NodeTypeSession && child.ID == sessionID {
+			child.Name = Truncate(title, 25)
+			return
+		}
+	}
+}
+
 // RemoveSession removes a session and all its children from the tree
 func (t *TreeView) RemoveSession(sessionID string) {
 	// Find and remove the session from root's children
@@ -374,6 +485,32 @@ func (t *TreeView) RemoveSession(sessionID string) {
 		}
 	}
 	t.rebuildNodeList()
+}
+
+// UpdateContext sets the latest context-size snapshot for a Main/Agent node.
+// agentID == "" targets the session's Main node; otherwise the matching Agent.
+// Tokens overwrite (not accumulate) — context size is a rolling snapshot,
+// not a sum. window is the model's max context window from
+// parser.ContextWindowFor.
+func (t *TreeView) UpdateContext(sessionID, agentID string, tokens, window int64) {
+	for _, session := range t.Root.Children {
+		if session.Type != NodeTypeSession || session.ID != sessionID {
+			continue
+		}
+		for _, child := range session.Children {
+			if agentID == "" && child.Type == NodeTypeMain {
+				child.ContextTokens = tokens
+				child.ContextWindow = window
+				return
+			}
+			if agentID != "" && child.Type == NodeTypeAgent && child.ID == agentID {
+				child.ContextTokens = tokens
+				child.ContextWindow = window
+				return
+			}
+		}
+		return
+	}
 }
 
 // UpdateActivity updates the active status of nodes and re-sorts them
@@ -504,14 +641,6 @@ func (t *TreeView) View() string {
 		}
 		indent := strings.Repeat("  ", depth)
 
-		// Checkbox
-		checkbox := "☑"
-		checkStyle := treeCheckedStyle
-		if !node.Enabled {
-			checkbox = "☐"
-			checkStyle = treeUncheckedStyle
-		}
-
 		// Tree branch character
 		branch := ""
 		if depth > 0 {
@@ -526,10 +655,14 @@ func (t *TreeView) View() string {
 		icon := ""
 		switch node.Type {
 		case NodeTypeSession:
+			arrow := "▾"
+			if node.Collapsed {
+				arrow = "▸"
+			}
 			if node.IsActive {
-				icon = "📁 "
+				icon = "📁" + arrow + " "
 			} else {
-				icon = "📂 "
+				icon = "📂" + arrow + " "
 			}
 		case NodeTypeMain:
 			if node.IsActive {
@@ -553,33 +686,94 @@ func (t *TreeView) View() string {
 
 		// Build line with name (muted if inactive)
 		name := node.Name
+		// Collapsed sessions show a hidden-agent count so users don't lose
+		// the signal that subagents exist underneath the collapsed node.
+		if node.Type == NodeTypeSession && node.Collapsed {
+			agents := 0
+			for _, c := range node.Children {
+				if c.Type == NodeTypeAgent {
+					agents++
+				}
+			}
+			if agents > 0 {
+				name = fmt.Sprintf("%s (+%d)", name, agents)
+			}
+		}
 		if !node.IsActive && node.Type != NodeTypeSession {
 			name = mutedStyle.Render(node.Name)
 		}
 
-		line := fmt.Sprintf("%s%s%s %s%s",
+		line := fmt.Sprintf("%s%s%s%s",
 			indent,
 			branch,
-			checkStyle.Render(checkbox),
 			icon,
 			name,
 		)
 
-		// Apply selection style
-		if i == t.cursor {
+		// Context-size suffix for Main/Agent nodes (e.g. "  142k/1M").
+		// Right-aligned when the line fits; appended otherwise. Truncation
+		// of over-wide lines (below) handles the worst case.
+		ctxSuffix := contextSuffix(node)
+		if ctxSuffix != "" && t.width > 0 {
+			innerWidth := t.width - 4
+			if innerWidth < 1 {
+				innerWidth = 1
+			}
+			used := lipglossWidth(line)
+			suffixW := lipglossWidth(ctxSuffix)
+			gap := innerWidth - used - suffixW
+			if gap >= 1 {
+				line += strings.Repeat(" ", gap) + mutedStyle.Render(ctxSuffix)
+			} else {
+				line += " " + mutedStyle.Render(ctxSuffix)
+			}
+		}
+
+		// Apply selection style. With the checkbox gone, disabled rows are
+		// muted so the user still has a visual signal for what they've
+		// toggled off (in addition to the inactive-children muting).
+		switch {
+		case i == t.cursor:
 			line = treeSelectedStyle.Render(line)
-		} else if !node.IsActive && node.Type != NodeTypeSession {
-			// Keep inactive agents muted even without selection
+		case !node.Enabled,
+			!node.IsActive && node.Type != NodeTypeSession:
 			line = mutedStyle.Render(line)
-		} else {
+		default:
 			line = treeNormalStyle.Render(line)
 		}
 
-		// Ensure consistent width
+		// Ensure consistent width.
+		//
+		// `t.width` is set by the caller to the OUTER width of the
+		// bordered pane the tree is rendered into. treeBorderStyle uses
+		// `Border()` (2 cols) + `Padding(0, 1)` (2 cols) = 4 cols of
+		// chrome, so the actual content area is `t.width - 4`.
+		//
+		// Padding to `t.width - 2` (the old value) put every line 2
+		// cols wider than the content area, which the terminal then
+		// wrapped to a second row. With emoji icons adding another
+		// visible column per line, every tree entry was 2-3 cols too
+		// wide and rendered as 2 terminal rows. That effectively
+		// doubled the tree height and overflowed the viewport,
+		// scrolling the header + top borders off the screen.
+		//
+		// runewidth.StringWidth (via lipglossWidth below) now correctly
+		// counts emoji as 2 cols, and the padding target is -4 so the
+		// line fits inside the bordered+padded pane without wrapping.
 		if t.width > 0 {
+			innerWidth := t.width - 4
+			if innerWidth < 1 {
+				innerWidth = 1
+			}
 			lineLen := lipglossWidth(line)
-			if lineLen < t.width-2 {
-				line += strings.Repeat(" ", t.width-2-lineLen)
+			if lineLen < innerWidth {
+				line += strings.Repeat(" ", innerWidth-lineLen)
+			} else if lineLen > innerWidth {
+				// ansi.Truncate is escape-aware: it cuts at exactly
+				// innerWidth visible columns while keeping the line's
+				// styling intact (the old stripAnsi+runewidth.Truncate
+				// dropped all color from truncated lines).
+				line = ansi.Truncate(line, innerWidth, "…")
 			}
 		}
 
@@ -589,13 +783,29 @@ func (t *TreeView) View() string {
 		}
 	}
 
-	// Pad to fill height
-	lines := strings.Count(b.String(), "\n") + 1
-	for i := lines; i < t.height-2; i++ {
-		b.WriteString("\n")
+	// Defensive: never emit more lines than the assigned inner height.
+	// The lipglossWidth fix above keeps each line from wrapping in the
+	// terminal, but if we simply have more nodes than height allows,
+	// we still need to cap the output so the pane doesn't overflow.
+	innerHeight := t.height - 2
+	if innerHeight < 1 {
+		innerHeight = 1
+	}
+	raw := b.String()
+	allLines := strings.Split(raw, "\n")
+	if len(allLines) > innerHeight {
+		// Keep the BOTTOM innerHeight lines — that's the most recent /
+		// most relevant content if nodes were appended over time. The
+		// future: add scroll support that respects t.cursor.
+		allLines = allLines[len(allLines)-innerHeight:]
 	}
 
-	return b.String()
+	// Pad to fill height
+	for len(allLines) < innerHeight {
+		allLines = append(allLines, "")
+	}
+
+	return strings.Join(allLines, "\n")
 }
 
 func (t *TreeView) getDepth(node *TreeNode) int {
@@ -616,26 +826,28 @@ func (t *TreeView) isLastChild(node *TreeNode) bool {
 	return len(children) > 0 && children[len(children)-1] == node
 }
 
-// lipglossWidth calculates visible width accounting for ANSI codes
-func lipglossWidth(s string) int {
-	return len([]rune(stripAnsi(s)))
+// contextSuffix returns "14%" for Main/Agent nodes once we've seen at least
+// one assistant message with usage info. Percentage of the model's max
+// context window used (input + cache_creation + cache_read / window).
+// Returns "" for sessions, background tasks, and agents with no usage yet.
+func contextSuffix(node *TreeNode) string {
+	if node.Type != NodeTypeMain && node.Type != NodeTypeAgent {
+		return ""
+	}
+	if node.ContextTokens <= 0 || node.ContextWindow <= 0 {
+		return ""
+	}
+	pct := node.ContextTokens * 100 / node.ContextWindow
+	return fmt.Sprintf("%d%%", pct)
 }
 
-func stripAnsi(s string) string {
-	var result strings.Builder
-	inEscape := false
-	for _, r := range s {
-		if r == '\x1b' {
-			inEscape = true
-			continue
-		}
-		if inEscape {
-			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-				inEscape = false
-			}
-			continue
-		}
-		result.WriteRune(r)
-	}
-	return result.String()
+// lipglossWidth calculates visible width accounting for ANSI codes.
+// ansi.StringWidth handles CSI/OSC escape sequences (the previous hand-rolled
+// stripper missed OSC) and East Asian wide characters / emoji, which occupy
+// 2 terminal columns despite being 1 rune. len([]rune(s)) would undercount
+// lines with 💤/📁/💬/🤖/✓/⏳ icons, causing them to be padded too short and
+// then wrap in the terminal — which made the tree taller than its assigned
+// height and overflowed the viewport, clipping the top of the TUI.
+func lipglossWidth(s string) int {
+	return ansi.StringWidth(s)
 }

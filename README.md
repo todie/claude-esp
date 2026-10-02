@@ -18,8 +18,10 @@ When using Claude Code interactively, tool outputs and thinking are collapsed by
 - **Hierarchical tree view** - Sessions with nested Main/Agent nodes
 - **Real-time streaming** - See thinking, tool calls, and outputs as they happen
 - **Subagent tracking** - Automatically discovers and displays subagent activity
+- **Session events** - Compaction boundaries, hook output (including hook errors, blocked stops and injected context), post-edit LSP diagnostics, PR-link and artifact-link events, session-cost summaries (cost, lines changed, models used), session continuations, background-task progress, prompt-cache misses (with reason + extra tokens), queue operations, slash-command invocations, transient notices, killed-subagent markers, model refusals, scheduled-task (cron / loop) fires, plan/auto mode transitions, permission-mode changes, and skill/MCP/tool deltas surfaced inline
 - **Agent type labels** - Shows agent types (Explore, code-reviewer, etc.) from `.meta.json`
 - **Token usage tracking** - Cumulative input/output token counts in the header bar
+- **Per-agent context size** - Each Main/subagent row shows current context as a percentage of the model's max context window (`Main 18%`, `Explore 9%`). Denominator is the model's *max window* (1M for the Claude 5 family and opus-4-6 through 4-8 / sonnet-4-6, 200k for haiku-4-5), **not** the auto-compact threshold
 - **Tool execution duration** - Shows how long each tool call took
 - **Background task visibility** - See background tasks (⏳/✓) under spawning agent
 - **Filtering** - Toggle visibility of thinking, tools, outputs per session/agent
@@ -69,6 +71,8 @@ claude-esp
 | `-p <ms>`  | Poll interval in ms (fallback mode only, default 500) |
 | `-w <dur>` | Active window duration (default `5m`, e.g. `30s`, `2m`) |
 | `-m <N>`   | Max sessions to show in tree (default 0 = unlimited) |
+| `-c <dur>` | Auto-collapse sessions inactive ≥ dur (default 0 = disabled, e.g. `2m`) |
+| `-D`       | Debug: surface raw `type:subtype` for every JSONL line type the parser would otherwise drop |
 | `-v`       | Show version                                  |
 | `-h`       | Show help                                     |
 
@@ -113,11 +117,25 @@ claude-esp -l
 | `A`       | Toggle auto-discovery of new sessions     |
 | `tab`     | Switch focus between tree and stream      |
 | `j/k/↑/↓` | Navigate tree or scroll stream            |
-| `space`   | Toggle selected item in tree              |
+| `space`   | On session: collapse/expand (pins on manual expand) · On agent: toggle visibility |
 | `s`       | Solo selected session/agent (toggle)      |
+| `d`       | Remove selected session from the tree     |
 | `enter`   | Load background task output (when selected)|
 | `g/G`     | Go to top/bottom of stream                |
 | `q`       | Quit                                      |
+
+## Auto-Collapse
+
+Run with `-c 2m` to automatically collapse sessions that have been idle for 2
+minutes. Collapsed sessions show `▸` instead of `▾` in the tree and display the
+count of hidden subagents (e.g. `📂▸ my-session (+2)`). Children of collapsed
+sessions are also filtered out of the stream pane — the whole point is to stop
+sleeping sessions from dominating your view.
+
+Press `space` on a collapsed session to expand it manually. Manual expansion
+**pins** the session — it won't auto-collapse again until it wakes up (receives
+new activity) and then goes idle once more. Press `s` to solo a session; if
+it's collapsed, Solo force-expands and pins it so you can see its output.
 
 ## How It Works
 
@@ -193,7 +211,7 @@ claude-esp/
 
 ## Development
 
-Built with [Bubbletea](https://github.com/charmbracelet/bubbletea) and [Lipgloss](https://github.com/charmbracelet/lipgloss). Issue tracking was done with [beads](https://github.com/steveyegge/beads).
+Built with [Bubbletea](https://github.com/charmbracelet/bubbletea) and [Lipgloss](https://github.com/charmbracelet/lipgloss).
 
 ```bash
 # Run tests

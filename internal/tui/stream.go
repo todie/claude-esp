@@ -21,7 +21,8 @@ const (
 type StreamView struct {
 	viewport    viewport.Model
 	items       []parser.StreamItem
-	seenToolIDs map[string]bool // dedupe tool input/output by ToolID
+	seenToolIDs map[string]bool   // dedupe tool input/output by ToolID
+	toolNames   map[string]string // ToolID → tool name, for labeling outputs in O(1)
 	width       int
 	height      int
 	autoScroll  bool
@@ -44,6 +45,7 @@ func NewStreamView() *StreamView {
 		viewport:       vp,
 		items:          make([]parser.StreamItem, 0),
 		seenToolIDs:    make(map[string]bool),
+		toolNames:      make(map[string]string),
 		autoScroll:     true,
 		maxLines:       MaxLinesPerItem,
 		showThinking:   true,
@@ -54,12 +56,31 @@ func NewStreamView() *StreamView {
 	}
 }
 
-// SetSize updates dimensions
+// SetSize updates dimensions.
+//
+// `width` is the OUTER width of the bordered pane the stream is rendered
+// into. streamBorderStyle uses `Border()` (2 cols) + `Padding(0, 1)`
+// (2 cols) = 4 cols of horizontal chrome. Vertical is border-only
+// (Padding(0, 1) is vertical=0, horizontal=1), so the viewport height is
+// `height - 2` for top + bottom border.
+//
+// Previously this used `width - 2`, which left the viewport 2 cols wider
+// than the actual content area and pushed every wrapped line past the
+// right border. That worked OK for ASCII but interacted with the tree
+// pane's over-wide padding to push the whole TUI past its viewport.
 func (s *StreamView) SetSize(width, height int) {
 	s.width = width
 	s.height = height
-	s.viewport.Width = width - 2 // account for border
-	s.viewport.Height = height - 2
+	innerWidth := width - 4
+	if innerWidth < 1 {
+		innerWidth = 1
+	}
+	innerHeight := height - 2
+	if innerHeight < 1 {
+		innerHeight = 1
+	}
+	s.viewport.Width = innerWidth
+	s.viewport.Height = innerHeight
 	s.updateContent()
 }
 
@@ -73,14 +94,35 @@ func (s *StreamView) AddItem(item parser.StreamItem) {
 			return // Skip duplicate
 		}
 		s.seenToolIDs[dedupKey] = true
+		if item.Type == parser.TypeToolInput && item.ToolName != "" {
+			s.toolNames[item.ToolID] = item.ToolName
+		}
 	}
 
 	s.items = append(s.items, item)
 	// Keep last MaxStreamItems items to prevent memory issues
 	if len(s.items) > MaxStreamItems {
 		s.items = s.items[len(s.items)-MaxStreamItems:]
+		s.rebuildToolIndexes()
 	}
 	s.updateContent()
+}
+
+// rebuildToolIndexes recreates seenToolIDs and toolNames from the surviving
+// items after truncation. Without this both maps grow without bound in
+// long-running sessions: entries for evicted items are never released.
+func (s *StreamView) rebuildToolIndexes() {
+	s.seenToolIDs = make(map[string]bool, len(s.items))
+	s.toolNames = make(map[string]string, len(s.items))
+	for _, it := range s.items {
+		if it.ToolID == "" {
+			continue
+		}
+		s.seenToolIDs[fmt.Sprintf("%s:%s", it.ToolID, it.Type)] = true
+		if it.Type == parser.TypeToolInput && it.ToolName != "" {
+			s.toolNames[it.ToolID] = it.ToolName
+		}
+	}
 }
 
 // SetEnabledFilters updates which session/agent combos are visible
@@ -157,6 +199,9 @@ func (s *StreamView) IsAutoScrollEnabled() bool {
 func (s *StreamView) updateContent() {
 	var b strings.Builder
 	contentWidth := s.width - 4 // account for borders and padding
+	if contentWidth < 1 {
+		contentWidth = 1
+	}
 
 	for _, item := range s.items {
 		// Check session/agent filter
@@ -204,6 +249,50 @@ func (s *StreamView) isItemEnabled(item parser.StreamItem) bool {
 }
 
 func (s *StreamView) renderItem(item parser.StreamItem, width int) string {
+	// Turn markers are a standalone single-line divider — no agent header,
+	// no trailing separator. Return early so the universal separator tail
+	// below doesn't double up.
+	if item.Type == parser.TypeTurnMarker {
+		dur := formatDuration(item.DurationMs)
+		text := fmt.Sprintf("── turn ended %s ──", dur)
+		return mutedStyle.Render(text)
+	}
+	if item.Type == parser.TypeCompactMarker {
+		text := "── compacted ──"
+		if item.Content != "" {
+			text = fmt.Sprintf("── compacted (%s) ──", item.Content)
+		}
+		return mutedStyle.Render(text)
+	}
+	if item.Type == parser.TypePRLink || item.Type == parser.TypeArtifactLink {
+		return mutedStyle.Render(fmt.Sprintf("── %s ──", item.Content))
+	}
+	if item.Type == parser.TypeCacheMiss {
+		text := "── cache miss ──"
+		if item.Content != "" {
+			text = fmt.Sprintf("── cache miss: %s ──", item.Content)
+		}
+		return mutedStyle.Render(text)
+	}
+	if item.Type == parser.TypeAPIError {
+		text := "── API error ──"
+		if item.Content != "" {
+			text = fmt.Sprintf("── API error: %s ──", oneLineSnippet(item.Content, 80))
+		}
+		return apiErrorStyle.Render(text)
+	}
+	if item.Type == parser.TypeSessionEvent {
+		label := item.ToolName
+		if label == "" {
+			label = "event"
+		}
+		text := fmt.Sprintf("── %s ──", label)
+		if item.Content != "" {
+			text = fmt.Sprintf("── %s: %s ──", label, oneLineSnippet(item.Content, 80))
+		}
+		return mutedStyle.Render(text)
+	}
+
 	var b strings.Builder
 
 	// Agent name styling
@@ -230,16 +319,8 @@ func (s *StreamView) renderItem(item parser.StreamItem, width int) string {
 		b.WriteString(toolInputContentStyle.Render(content))
 
 	case parser.TypeToolOutput:
-		// Look up tool name from matching ToolInput
-		toolName := ""
-		if item.ToolID != "" {
-			for _, other := range s.items {
-				if other.Type == parser.TypeToolInput && other.ToolID == item.ToolID {
-					toolName = other.ToolName
-					break
-				}
-			}
-		}
+		// Look up tool name from the matching ToolInput's index entry
+		toolName := s.toolNames[item.ToolID]
 		var outputLabel string
 		if toolName != "" {
 			outputLabel = toolOutputIcon + " " + toolName + " result"
@@ -259,10 +340,53 @@ func (s *StreamView) renderItem(item parser.StreamItem, width int) string {
 		b.WriteString(fmt.Sprintf("%s%s%s\n", agentName, sep, header))
 		content := s.truncateContent(item.Content, width)
 		b.WriteString(content)
+
+	case parser.TypeHookOutput:
+		label := hookIcon + " Hook"
+		if item.ToolName != "" {
+			label += " " + item.ToolName
+		}
+		if item.DurationMs > 0 {
+			label += " " + formatDuration(item.DurationMs)
+		}
+		header := hookStyle.Render(label)
+		b.WriteString(fmt.Sprintf("%s%s%s\n", agentName, sep, header))
+		if item.Content != "" {
+			content := s.truncateContent(item.Content, width)
+			b.WriteString(hookContentStyle.Render(content))
+		}
+
+	case parser.TypeDiagnostics:
+		label := diagnosticsIcon + " Diagnostics"
+		if item.ToolName != "" {
+			label += " " + item.ToolName
+		}
+		header := diagnosticsStyle.Render(label)
+		b.WriteString(fmt.Sprintf("%s%s%s\n", agentName, sep, header))
+		if item.Content != "" {
+			content := s.truncateContent(item.Content, width)
+			b.WriteString(diagnosticsContentStyle.Render(content))
+		}
+
+	case parser.TypeDebug:
+		label := debugIcon + " Debug"
+		if item.ToolName != "" {
+			label += " " + item.ToolName
+		}
+		header := debugStyle.Render(label)
+		b.WriteString(fmt.Sprintf("%s%s%s\n", agentName, sep, header))
+		if item.Content != "" {
+			content := s.truncateContent(item.Content, width)
+			b.WriteString(debugContentStyle.Render(content))
+		}
 	}
 
 	// Add separator line
-	b.WriteString("\n" + separatorStyle.Render(strings.Repeat("─", min(width, 60))))
+	sepWidth := min(width, 60)
+	if sepWidth < 0 {
+		sepWidth = 0
+	}
+	b.WriteString("\n" + separatorStyle.Render(strings.Repeat("─", sepWidth)))
 
 	return b.String()
 }
@@ -323,6 +447,19 @@ func formatDuration(ms int64) string {
 	}
 	mins := secs / 60.0
 	return fmt.Sprintf("(%.1fm)", mins)
+}
+
+// oneLineSnippet collapses whitespace into single spaces and truncates to
+// `max` runes with a trailing "…" if needed. Used by single-line markers
+// where the source content may contain newlines or be much longer than the
+// marker line should be.
+func oneLineSnippet(s string, max int) string {
+	flat := strings.Join(strings.Fields(s), " ")
+	if utf8.RuneCountInString(flat) <= max {
+		return flat
+	}
+	runes := []rune(flat)
+	return string(runes[:max]) + "…"
 }
 
 // View renders the stream
