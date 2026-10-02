@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -244,6 +245,37 @@ func TestTruncateContent_Emoji(t *testing.T) {
 	}
 }
 
+// TestStreamView_NarrowResizeDoesNotPanic guards against a regression where
+// SetSize stored a small/negative raw width in s.width while clamping only
+// the viewport, causing strings.Repeat in renderItem to panic with
+// "negative Repeat count" once an item was rendered.
+func TestStreamView_NarrowResizeDoesNotPanic(t *testing.T) {
+	s := NewStreamView()
+	s.SetSize(80, 24)
+	s.SetEnabledFilters([]EnabledFilter{{SessionID: "sess1", AgentID: ""}})
+	// Cover every render branch that uses width.
+	for _, typ := range []parser.StreamItemType{
+		parser.TypeThinking,
+		parser.TypeToolInput,
+		parser.TypeToolOutput,
+		parser.TypeText,
+		parser.TypeHookOutput,
+		parser.TypeDiagnostics,
+		parser.TypeDebug,
+	} {
+		s.AddItem(newTestItem(typ, "sess1", "", "content"))
+	}
+
+	// Each width here corresponds to a real callsite scenario where
+	// model.go passes m.width-m.treeWidth-5 (or similar) and the result
+	// underflows the inner content width.
+	for _, width := range []int{0, 1, 2, 3, 4, 5, -1, -10} {
+		// Should never panic, even with an unrenderably narrow width.
+		s.SetSize(width, 5)
+		_ = s.View()
+	}
+}
+
 func TestStreamView_ToggleStates(t *testing.T) {
 	s := NewStreamView()
 
@@ -261,5 +293,60 @@ func TestStreamView_ToggleStates(t *testing.T) {
 	s.ToggleToolOutput()
 	if s.IsToolOutputEnabled() {
 		t.Error("tool output should be disabled after toggle")
+	}
+}
+
+func TestStreamView_ToolIndexesPrunedOnTruncation(t *testing.T) {
+	s := NewStreamView()
+	s.SetSize(80, 24)
+
+	// Push well past MaxStreamItems with unique tool IDs; the dedup and
+	// name indexes must track only the surviving items, not grow forever.
+	for i := 0; i < MaxStreamItems+500; i++ {
+		item := newTestItem(parser.TypeToolInput, "sess1", "", "input")
+		item.ToolID = fmt.Sprintf("tool-%d", i)
+		item.ToolName = "Bash"
+		s.AddItem(item)
+	}
+
+	if len(s.items) != MaxStreamItems {
+		t.Fatalf("expected %d items, got %d", MaxStreamItems, len(s.items))
+	}
+	if len(s.seenToolIDs) > MaxStreamItems {
+		t.Errorf("seenToolIDs grew unboundedly: %d entries for %d items", len(s.seenToolIDs), len(s.items))
+	}
+	if len(s.toolNames) > MaxStreamItems {
+		t.Errorf("toolNames grew unboundedly: %d entries for %d items", len(s.toolNames), len(s.items))
+	}
+}
+
+func TestStreamView_ToolOutputLabelFromIndex(t *testing.T) {
+	s := NewStreamView()
+	s.SetSize(80, 24)
+	s.SetEnabledFilters([]EnabledFilter{{SessionID: "sess1", AgentID: ""}})
+
+	in := newTestItem(parser.TypeToolInput, "sess1", "", "ls")
+	in.ToolID = "t1"
+	in.ToolName = "Bash"
+	s.AddItem(in)
+
+	out := newTestItem(parser.TypeToolOutput, "sess1", "", "file.txt")
+	out.ToolID = "t1"
+	s.AddItem(out)
+
+	rendered := s.renderItem(out, 76)
+	if !strings.Contains(rendered, "Bash result") {
+		t.Errorf("expected output labeled with tool name, got %q", rendered)
+	}
+}
+
+func TestStreamView_APIErrorMarker(t *testing.T) {
+	s := NewStreamView()
+	s.SetSize(80, 24)
+
+	item := newTestItem(parser.TypeAPIError, "sess1", "", "529 Overloaded, retry 1/10")
+	rendered := s.renderItem(item, 76)
+	if !strings.Contains(rendered, "API error: 529 Overloaded, retry 1/10") {
+		t.Errorf("unexpected api error rendering: %q", rendered)
 	}
 }

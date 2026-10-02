@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/mattn/go-runewidth"
 	"github.com/phiat/claude-esp/internal/parser"
 )
 
@@ -166,7 +167,8 @@ type Watcher struct {
 	claudeDir         string
 	pollInterval      time.Duration
 	sessions          map[string]*Session
-	sessionsMu        sync.RWMutex     // protects sessions map
+	removed           map[string]bool  // session IDs removed by the user; never re-discovered
+	sessionsMu        sync.RWMutex     // protects sessions and removed maps
 	filePositions     map[string]int64 // track read position per file
 	filePosMu         sync.RWMutex     // protects filePositions map
 	Items             chan parser.StreamItem
@@ -213,6 +215,7 @@ func New(sessionID string, pollInterval time.Duration, activeWindow time.Duratio
 		claudeDir:         claudeDir,
 		pollInterval:      pollInterval,
 		sessions:          make(map[string]*Session),
+		removed:           make(map[string]bool),
 		filePositions:     make(map[string]int64),
 		Items:             make(chan parser.StreamItem, ItemChannelBuffer),
 		Errors:            make(chan error, ErrorChannelBuffer),
@@ -390,9 +393,16 @@ func (w *Watcher) discoverActiveSessions() error {
 		discovered = discovered[:w.maxSessions]
 	}
 
+	// Hold the lock: this also runs from the fsnotify goroutine (via
+	// handleFsCreate) after Start, concurrently with readers.
+	w.sessionsMu.Lock()
 	for _, d := range discovered {
+		if w.removed[d.session.ID] {
+			continue
+		}
 		w.sessions[d.session.ID] = d.session
 	}
+	w.sessionsMu.Unlock()
 
 	return err
 }
@@ -402,10 +412,12 @@ func (w *Watcher) SetSkipHistory(skip bool) {
 	w.skipHistory.Store(skip)
 }
 
-// RemoveSession removes a session from being watched
+// RemoveSession removes a session from being watched and marks it so
+// auto-discovery (polling or fsnotify) doesn't immediately re-add it.
 func (w *Watcher) RemoveSession(sessionID string) {
 	w.sessionsMu.Lock()
 	delete(w.sessions, sessionID)
+	w.removed[sessionID] = true
 	w.sessionsMu.Unlock()
 }
 
@@ -422,9 +434,10 @@ func (w *Watcher) IsAutoDiscoveryEnabled() bool {
 
 // ActivityInfo contains activity status for a session/agent
 type ActivityInfo struct {
-	SessionID string
-	AgentID   string // empty for main
-	IsActive  bool
+	SessionID    string
+	AgentID      string // empty for main
+	IsActive     bool
+	LastModified time.Time // file mod time — used to drive auto-collapse policy
 }
 
 // GetActivityInfo returns activity status for all watched sessions and agents
@@ -440,9 +453,10 @@ func (w *Watcher) GetActivityInfo(activeWithin time.Duration) []ActivityInfo {
 		// Check main file
 		if fi, err := os.Stat(session.MainFile); err == nil {
 			info = append(info, ActivityInfo{
-				SessionID: session.ID,
-				AgentID:   "",
-				IsActive:  now.Sub(fi.ModTime()) < activeWithin,
+				SessionID:    session.ID,
+				AgentID:      "",
+				IsActive:     now.Sub(fi.ModTime()) < activeWithin,
+				LastModified: fi.ModTime(),
 			})
 		}
 
@@ -451,9 +465,10 @@ func (w *Watcher) GetActivityInfo(activeWithin time.Duration) []ActivityInfo {
 		for agentID, path := range session.Subagents {
 			if fi, err := os.Stat(path); err == nil {
 				info = append(info, ActivityInfo{
-					SessionID: session.ID,
-					AgentID:   agentID,
-					IsActive:  now.Sub(fi.ModTime()) < activeWithin,
+					SessionID:    session.ID,
+					AgentID:      agentID,
+					IsActive:     now.Sub(fi.ModTime()) < activeWithin,
+					LastModified: fi.ModTime(),
 				})
 			}
 		}
@@ -672,25 +687,48 @@ func extractToolNameFromLine(line string, toolID string) string {
 	return ""
 }
 
+// truncate shortens s to max terminal columns, adding "..." if it was cut.
+//
+// This mirrors tui.Truncate. It is duplicated rather than imported because
+// internal/tui already imports this package, so the reverse would be a cycle.
+func truncate(s string, max int) string {
+	if runewidth.StringWidth(s) <= max {
+		return s
+	}
+	ellipsis := max > 3
+	budget := max
+	if ellipsis {
+		budget = max - 3
+	}
+	var b strings.Builder
+	used := 0
+	for _, r := range s {
+		w := runewidth.RuneWidth(r)
+		if used+w > budget {
+			break
+		}
+		b.WriteRune(r)
+		used += w
+	}
+	if ellipsis {
+		b.WriteString("...")
+	}
+	return b.String()
+}
+
 // formatToolName creates a display name like "Bash: npm install"
 func formatToolName(toolName string, line string) string {
 	// For Bash, try to extract the command
 	if toolName == "Bash" {
 		if cmd := extractField(line, "command"); cmd != "" {
-			if len(cmd) > 30 {
-				cmd = cmd[:30] + "..."
-			}
-			return "Bash: " + cmd
+			return "Bash: " + truncate(cmd, 33)
 		}
 	}
 
-	// For Task, try to get description
-	if toolName == "Task" {
+	// Task (legacy) and Agent (current name) both carry a "description" field
+	if toolName == "Task" || toolName == "Agent" {
 		if desc := extractField(line, "description"); desc != "" {
-			if len(desc) > 30 {
-				desc = desc[:30] + "..."
-			}
-			return "Task: " + desc
+			return toolName + ": " + truncate(desc, 33)
 		}
 	}
 
@@ -940,6 +978,11 @@ func (w *Watcher) handleFsCreate(path string) {
 // created before the fsnotify watch was established. This closes the race window
 // where in-process agents write files between directory creation and watch setup.
 // All discovery handlers are idempotent, so duplicate calls are safe no-ops.
+//
+// When a parent directory (e.g. <sessionID>/) and its children (e.g. subagents/)
+// are created simultaneously (mkdir -p style), the CREATE event for the child
+// directory fires before we add a watch on the parent, so it is lost. Recursing
+// into subdirectories here ensures we add watches and scan those children too.
 func (w *Watcher) scanNewDirectory(path string) {
 	entries, err := os.ReadDir(path)
 	if err != nil {
@@ -948,12 +991,15 @@ func (w *Watcher) scanNewDirectory(path string) {
 
 	base := filepath.Base(path)
 	for _, entry := range entries {
+		fullPath := filepath.Join(path, entry.Name())
 		if entry.IsDir() {
+			// Add a watch and recurse: the CREATE event for this subdirectory
+			// may have been lost if it was created before the parent was watched.
+			w.fsWatcher.Add(fullPath)
+			w.scanNewDirectory(fullPath)
 			continue
 		}
 		name := entry.Name()
-		fullPath := filepath.Join(path, name)
-
 		switch {
 		case base == "subagents" && strings.HasSuffix(name, ".jsonl"):
 			w.handleNewSubagentFile(fullPath)
@@ -1007,7 +1053,7 @@ func (w *Watcher) handleNewSessionFile(path string) {
 	}
 
 	w.sessionsMu.Lock()
-	if _, exists := w.sessions[session.ID]; exists {
+	if _, exists := w.sessions[session.ID]; exists || w.removed[session.ID] {
 		w.sessionsMu.Unlock()
 		return
 	}
@@ -1020,6 +1066,20 @@ func (w *Watcher) handleNewSessionFile(path string) {
 	case w.NewSession <- NewSessionMsg{SessionID: session.ID, ProjectPath: session.ProjectPath}:
 	default:
 	}
+
+	// buildSession may have found subagents that already existed on disk.
+	// Emit NewAgentMsg for each so the TUI shows them. Without this, the
+	// idempotency check in handleNewSubagentFile would suppress the message
+	// (the agent is already in session.Subagents but the TUI was never told).
+	session.mu.RLock()
+	for agentID := range session.Subagents {
+		agentType := session.SubagentTypes[agentID]
+		select {
+		case w.NewAgent <- NewAgentMsg{SessionID: session.ID, AgentID: agentID, AgentType: agentType}:
+		default:
+		}
+	}
+	session.mu.RUnlock()
 }
 
 // lookupAgentType returns the stored agent type for a given session/agent pair.
@@ -1184,9 +1244,10 @@ func (w *Watcher) checkForNewSessions() {
 
 		w.sessionsMu.RLock()
 		_, exists := w.sessions[id]
+		removed := w.removed[id]
 		w.sessionsMu.RUnlock()
 
-		if exists {
+		if exists || removed {
 			return nil
 		}
 
@@ -1333,21 +1394,27 @@ func (w *Watcher) skipToEndOfFiles(session *Session) {
 
 // findPositionForLastNLines returns the byte offset to start reading the last N lines
 func findPositionForLastNLines(path string, n int) int64 {
+	if n <= 0 {
+		return 0
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return 0
 	}
 	defer file.Close()
 
-	// Collect positions of all newlines
-	var newlinePositions []int64
+	// Track only the last n newline positions in a ring buffer — keeps
+	// memory O(n) instead of one offset per line in the whole file.
+	ring := make([]int64, n)
+	var count int64
 	var pos int64
 	buf := make([]byte, FileReadBufferSize)
 	for {
 		bytesRead, err := file.Read(buf)
 		for i := 0; i < bytesRead; i++ {
 			if buf[i] == '\n' {
-				newlinePositions = append(newlinePositions, pos+int64(i)+1)
+				ring[count%int64(n)] = pos + int64(i) + 1
+				count++
 			}
 		}
 		pos += int64(bytesRead)
@@ -1357,12 +1424,13 @@ func findPositionForLastNLines(path string, n int) int64 {
 	}
 
 	// If fewer than N lines, start from beginning
-	if len(newlinePositions) <= n {
+	if count <= int64(n) {
 		return 0
 	}
 
-	// Return position after the newline that's N lines from the end
-	return newlinePositions[len(newlinePositions)-n]
+	// Return position after the newline that's N lines from the end:
+	// the oldest entry still in the ring.
+	return ring[count%int64(n)]
 }
 
 func (w *Watcher) readSessionFiles(session *Session) {

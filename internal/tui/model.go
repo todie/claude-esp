@@ -22,38 +22,44 @@ const (
 
 // Model is the main TUI model
 type Model struct {
-	tree              *TreeView
-	stream            *StreamView
-	watcher           *watcher.Watcher
-	focus             Focus
-	showTree          bool
-	width             int
-	height            int
-	treeWidth         int
-	sessionID         string
-	skipHistory       bool
-	pollInterval      time.Duration
-	activeWindow      time.Duration
-	maxSessions       int
-	err               error
-	quitting          bool
-	totalInputTokens  int64
-	totalOutputTokens int64
+	tree               *TreeView
+	stream             *StreamView
+	watcher            *watcher.Watcher
+	focus              Focus
+	showTree           bool
+	width              int
+	height             int
+	treeWidth          int
+	sessionID          string
+	skipHistory        bool
+	pollInterval       time.Duration
+	activeWindow       time.Duration
+	maxSessions        int
+	collapseAfter      time.Duration // 0 = disabled
+	err                error
+	quitting           bool
+	totalInputTokens   int64
+	totalOutputTokens  int64
+	totalCacheCreation int64
+	totalCacheRead     int64
 }
 
-// NewModel creates a new TUI model
-func NewModel(sessionID string, skipHistory bool, pollInterval time.Duration, activeWindow time.Duration, maxSessions int) *Model {
+// NewModel creates a new TUI model. If collapseAfter > 0, sessions inactive
+// for that duration will auto-collapse in the tree (and be hidden from the
+// stream). See tree.Toggle / Solo for the interactive counterpart.
+func NewModel(sessionID string, skipHistory bool, pollInterval time.Duration, activeWindow time.Duration, maxSessions int, collapseAfter time.Duration) *Model {
 	return &Model{
-		tree:         NewTreeView(),
-		stream:       NewStreamView(),
-		focus:        FocusStream,
-		showTree:     true,
-		treeWidth:    25,
-		sessionID:    sessionID,
-		skipHistory:  skipHistory,
-		pollInterval: pollInterval,
-		activeWindow: activeWindow,
-		maxSessions:  maxSessions,
+		tree:          NewTreeView(),
+		stream:        NewStreamView(),
+		focus:         FocusStream,
+		showTree:      true,
+		treeWidth:     30,
+		sessionID:     sessionID,
+		skipHistory:   skipHistory,
+		pollInterval:  pollInterval,
+		activeWindow:  activeWindow,
+		maxSessions:   maxSessions,
+		collapseAfter: collapseAfter,
 	}
 }
 
@@ -133,12 +139,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamItemMsg:
 		item := parser.StreamItem(msg)
+		// Session-title items update the tree label, not the stream.
+		if item.Type == parser.TypeSessionTitle {
+			m.tree.SetSessionTitle(item.SessionID, item.Content)
+			break
+		}
 		// Accumulate token usage (includes history — shows total session cost)
 		if item.InputTokens > 0 {
 			m.totalInputTokens += item.InputTokens
 		}
 		if item.OutputTokens > 0 {
 			m.totalOutputTokens += item.OutputTokens
+		}
+		if item.CacheCreationTokens > 0 {
+			m.totalCacheCreation += item.CacheCreationTokens
+		}
+		if item.CacheReadTokens > 0 {
+			m.totalCacheRead += item.CacheReadTokens
+		}
+		// Per-agent context size: latest snapshot, not a sum. The prompt
+		// size for a turn is input + cache_creation + cache_read; output
+		// tokens don't fill the context window.
+		if item.Model != "" {
+			ctx := item.InputTokens + item.CacheCreationTokens + item.CacheReadTokens
+			if ctx > 0 {
+				m.tree.UpdateContext(item.SessionID, item.AgentID, ctx, parser.ContextWindowFor(item.Model))
+			}
 		}
 		m.stream.AddItem(item)
 		m.stream.SetEnabledFilters(m.tree.GetEnabledFilters())
@@ -260,6 +286,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "x":
 		m.stream.ToggleText()
 
+	case "d":
+		// Remove the selected session from the tree and the watcher. The
+		// watcher remembers the ID so auto-discovery doesn't re-add it.
+		if m.focus == FocusTree {
+			if sessionID := m.tree.GetSelectedSession(); sessionID != "" {
+				m.tree.RemoveSession(sessionID)
+				if m.watcher != nil {
+					m.watcher.RemoveSession(sessionID)
+				}
+				m.stream.SetEnabledFilters(m.tree.GetEnabledFilters())
+			}
+		}
+
 	case "s":
 		if m.focus == FocusTree {
 			m.tree.Solo()
@@ -280,9 +319,52 @@ func (m *Model) updateActivityStatus() {
 	if m.watcher == nil {
 		return
 	}
-	// Check activity within last 30 seconds
-	for _, info := range m.watcher.GetActivityInfo(30 * time.Second) {
+	// Check activity within last 30 seconds. Gather infos once so the collapse
+	// policy sees the same snapshot.
+	infos := m.watcher.GetActivityInfo(30 * time.Second)
+	for _, info := range infos {
 		m.tree.UpdateActivity(info.SessionID, info.AgentID, info.IsActive)
+	}
+	if m.collapseAfter > 0 {
+		m.applyCollapsePolicy(infos)
+	}
+}
+
+// applyCollapsePolicy auto-collapses sessions whose newest-modified file is
+// older than collapseAfter. A session wakes up (LastModified is recent) →
+// any user-set Pin is cleared so the next sleep cycle re-auto-collapses.
+// This is the "pin resets on wake" semantic discussed in issue #5 Option D.
+func (m *Model) applyCollapsePolicy(infos []watcher.ActivityInfo) {
+	// Find newest LastModified across main + all agents per session.
+	latest := map[string]time.Time{}
+	for _, info := range infos {
+		if t, ok := latest[info.SessionID]; !ok || info.LastModified.After(t) {
+			latest[info.SessionID] = info.LastModified
+		}
+	}
+
+	now := time.Now()
+	for _, node := range m.tree.Root.Children {
+		if node.Type != NodeTypeSession {
+			continue
+		}
+		lastMod, ok := latest[node.ID]
+		if !ok {
+			continue
+		}
+
+		sessionActive := now.Sub(lastMod) < 30*time.Second
+		if sessionActive {
+			// Woke up: clear any prior pin so the next sleep cycle auto-collapses.
+			if node.Pinned {
+				m.tree.SetPinned(node.ID, false)
+			}
+			continue
+		}
+
+		if now.Sub(lastMod) >= m.collapseAfter && !node.Collapsed && !node.Pinned {
+			m.tree.SetCollapsed(node.ID, true)
+		}
 	}
 }
 
@@ -324,13 +406,63 @@ func (m *Model) loadBackgroundTaskOutput(node *TreeNode) {
 	m.stream.ScrollDown(9999)
 }
 
+// wrappedRows returns how many terminal rows a single-line string will
+// occupy at the current pane width. lipgloss.Render() does NOT wrap text
+// unless Width() is set on the style, so a long header string comes back
+// as a single line from lipgloss.Height() even though the terminal will
+// wrap it at display time. We compute the wrap ourselves by measuring the
+// visible character width and dividing by the pane width.
+func (m *Model) wrappedRows(s string) int {
+	if m.width <= 0 {
+		return 1
+	}
+	visible := lipgloss.Width(s)
+	// lipgloss.Height also catches any intentional newlines inside s
+	newlines := lipgloss.Height(s)
+	rowsPerLogicalLine := (visible + m.width - 1) / m.width // ceil
+	if rowsPerLogicalLine < 1 {
+		rowsPerLogicalLine = 1
+	}
+	// If the string has embedded newlines, each logical line can itself wrap.
+	// This is a conservative approximation: multiply by visible/width.
+	// For single-line strings (the common case for header/help), newlines=1.
+	rows := newlines * rowsPerLogicalLine
+	if rows < 1 {
+		return 1
+	}
+	return rows
+}
+
+// chromeHeight returns how many rows the header + help bar actually occupy
+// at the current width. The header wraps on narrow terminals because of
+// the toggle labels, so measuring it dynamically prevents the tree/stream
+// panes from overflowing the top of the viewport.
+//
+// Total rows we reserve: header (measured, wrap-aware) + help (measured,
+// wrap-aware) + 2 for the inner pane's top+bottom border.
+func (m *Model) chromeHeight() int {
+	headerRows := m.wrappedRows(m.renderHeader())
+	helpRows := m.wrappedRows(m.renderHelp())
+	return headerRows + helpRows + 2
+}
+
+// contentInnerHeight is the Height(...) value we pass to the tree/stream
+// styled pane. Always at least 1 row so the TUI doesn't collapse on
+// minuscule terminals.
+func (m *Model) contentInnerHeight() int {
+	h := m.height - m.chromeHeight()
+	if h < 1 {
+		return 1
+	}
+	return h
+}
+
 func (m *Model) updateLayout() {
 	if m.width == 0 || m.height == 0 {
 		return
 	}
 
-	// Reserve space for header and help bar
-	contentHeight := m.height - 4
+	contentHeight := m.contentInnerHeight()
 
 	if m.showTree {
 		m.tree.SetSize(m.treeWidth, contentHeight)
@@ -353,6 +485,11 @@ func (m *Model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
+
+	// Recompute layout in case the header wrapped to more rows than we
+	// planned for (e.g. after a terminal resize or after the watcher
+	// reports more sessions and the session-count label changes width).
+	m.updateLayout()
 
 	var b strings.Builder
 
@@ -398,19 +535,25 @@ func (m *Model) renderHeader() string {
 			sessionInfo = "Waiting..."
 		} else if len(sessions) == 1 {
 			for _, s := range sessions {
-				sessionInfo = fmt.Sprintf("Session: %s%s", truncate(s.ID, 12), autoDisc)
+				sessionInfo = fmt.Sprintf("Session: %s%s", Truncate(s.ID, 12), autoDisc)
 			}
 		} else {
 			sessionInfo = fmt.Sprintf("%d sessions%s", len(sessions), autoDisc)
 		}
 	}
 
-	// Token usage display
+	// Token usage display (in / out / cache write+read)
 	tokenInfo := ""
-	if m.totalInputTokens > 0 || m.totalOutputTokens > 0 {
+	if m.totalInputTokens > 0 || m.totalOutputTokens > 0 ||
+		m.totalCacheCreation > 0 || m.totalCacheRead > 0 {
 		tokenInfo = fmt.Sprintf("│ %s in / %s out",
 			formatTokenCount(m.totalInputTokens),
 			formatTokenCount(m.totalOutputTokens))
+		if m.totalCacheCreation > 0 || m.totalCacheRead > 0 {
+			tokenInfo += fmt.Sprintf(" / %s+%s cache",
+				formatTokenCount(m.totalCacheCreation),
+				formatTokenCount(m.totalCacheRead))
+		}
 	}
 
 	// Build header - use plain text and apply headerStyle uniformly (like Rust version)
@@ -436,14 +579,19 @@ func formatTokenCount(n int64) string {
 }
 
 func (m *Model) renderToggle(name string, enabled bool, key string) string {
-	checkbox := "☐"
-	if enabled {
-		checkbox = "☑"
+	// Drop the ☑/☐ checkbox column — disabled toggles get a leading
+	// mid-dot marker, enabled toggles a leading space, so the bar's
+	// column widths stay aligned without the checkbox.
+	marker := " "
+	if !enabled {
+		marker = "·"
 	}
-	return fmt.Sprintf("%s %s[%s]", checkbox, name, key)
+	return fmt.Sprintf("%s%s[%s]", marker, name, key)
 }
 
 func (m *Model) renderWithTree() string {
+	innerHeight := m.contentInnerHeight()
+
 	// Tree pane
 	treeBorder := treeBorderStyle
 	if m.focus == FocusTree {
@@ -451,7 +599,7 @@ func (m *Model) renderWithTree() string {
 	}
 	treePane := treeBorder.
 		Width(m.treeWidth).
-		Height(m.height - 4).
+		Height(innerHeight).
 		Render(m.tree.View())
 
 	// Stream pane
@@ -461,7 +609,7 @@ func (m *Model) renderWithTree() string {
 	}
 	streamPane := streamBorder.
 		Width(m.width - m.treeWidth - 5).
-		Height(m.height - 4).
+		Height(innerHeight).
 		Render(m.stream.View())
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, treePane, " ", streamPane)
@@ -471,14 +619,14 @@ func (m *Model) renderStreamOnly() string {
 	streamBorder := streamBorderStyle.BorderForeground(primaryColor)
 	return streamBorder.
 		Width(m.width - 2).
-		Height(m.height - 4).
+		Height(m.contentInnerHeight()).
 		Render(m.stream.View())
 }
 
 func (m *Model) renderHelp() string {
 	var help string
 	if m.focus == FocusTree {
-		help = "j/k: navigate │ space: toggle │ s: solo │ A: auto-discover │ q: quit"
+		help = "j/k: navigate │ space: toggle │ s: solo │ d: remove │ A: auto-discover │ q: quit"
 	} else {
 		help = "j/k: scroll │ g/G: top/bottom │ A: auto-discover │ tab: tree │ q: quit"
 	}

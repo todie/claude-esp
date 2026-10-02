@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -120,31 +121,46 @@ func TestTreeView_AddBackgroundTaskUnderAgent(t *testing.T) {
 }
 
 func TestTreeView_Toggle(t *testing.T) {
+	// On a session node, space now collapses/expands (not enable/disable).
+	// On non-session nodes it still toggles the Enabled flag.
 	tv := NewTreeView()
 	tv.AddSession("sess1", "project")
+	tv.AddAgent("sess1", "agent1", "")
 
-	// Cursor is at session node (index 0)
-	tv.cursor = 0
+	tv.cursor = 0 // session
 	session := tv.Root.Children[0]
 
-	if !session.Enabled {
-		t.Error("session should be enabled by default")
+	if session.Collapsed {
+		t.Error("session should not be collapsed by default")
 	}
-
 	tv.Toggle()
-	if session.Enabled {
-		t.Error("session should be disabled after toggle")
+	if !session.Collapsed {
+		t.Error("session should be collapsed after first toggle")
 	}
-	// Children should also be disabled
+	// Children remain Enabled — collapse hides them in the tree/stream, but
+	// doesn't alter their per-node enable state.
 	for _, child := range session.Children {
-		if child.Enabled {
-			t.Error("child should be disabled when session is toggled off")
+		if !child.Enabled {
+			t.Error("children Enabled flag should be untouched by session collapse")
 		}
 	}
 
 	tv.Toggle()
-	if !session.Enabled {
-		t.Error("session should be re-enabled after second toggle")
+	if session.Collapsed {
+		t.Error("session should be expanded after second toggle")
+	}
+	if !session.Pinned {
+		t.Error("manual expand should pin the session")
+	}
+
+	// Non-session Toggle still flips Enabled.
+	// Cursor is back at 0 (session); move to Main (index 1) after rebuild.
+	tv.cursor = 1
+	main := tv.nodes[1]
+	wasEnabled := main.Enabled
+	tv.Toggle()
+	if main.Enabled == wasEnabled {
+		t.Error("Toggle on Main node should flip Enabled")
 	}
 }
 
@@ -339,6 +355,79 @@ func TestTreeView_ViewEmpty(t *testing.T) {
 	view := tv.View()
 	if view == "" {
 		t.Error("empty tree should still render something")
+	}
+}
+
+func TestTreeView_CollapseHidesChildrenFromFlatten(t *testing.T) {
+	tv := NewTreeView()
+	tv.AddSession("sess1", "project")
+	tv.AddAgent("sess1", "agent1", "")
+	// Before collapse: 3 nodes (session, main, agent)
+	if len(tv.nodes) != 3 {
+		t.Fatalf("pre-collapse: expected 3 nodes, got %d", len(tv.nodes))
+	}
+
+	tv.SetCollapsed("sess1", true)
+	// After collapse: only the session node remains in flattened list
+	if len(tv.nodes) != 1 {
+		t.Errorf("post-collapse: expected 1 node, got %d", len(tv.nodes))
+	}
+	if tv.nodes[0].Type != NodeTypeSession {
+		t.Error("post-collapse: only node should be the session")
+	}
+
+	// Collapsed session's children should also be absent from enabled filters.
+	if len(tv.GetEnabledFilters()) != 0 {
+		t.Error("collapsed session children should not appear in enabled filters")
+	}
+}
+
+func TestTreeView_CollapsedSessionShowsAgentCount(t *testing.T) {
+	tv := NewTreeView()
+	tv.AddSession("sess1", "project")
+	tv.AddAgent("sess1", "agent1", "")
+	tv.AddAgent("sess1", "agent2", "")
+	tv.SetCollapsed("sess1", true)
+	tv.SetSize(40, 10)
+
+	view := tv.View()
+	if !strings.Contains(view, "(+2)") {
+		t.Errorf("collapsed session view should show (+2) agent count, got:\n%s", view)
+	}
+}
+
+func TestTreeView_SetCollapsedMovesCursorUpFromHiddenChild(t *testing.T) {
+	tv := NewTreeView()
+	tv.AddSession("sess1", "project")
+	tv.AddAgent("sess1", "agent1", "")
+	tv.cursor = 2 // agent row
+
+	tv.SetCollapsed("sess1", true)
+	// Cursor should have moved from the now-hidden agent to the session row.
+	if tv.cursor != 0 {
+		t.Errorf("cursor = %d, want 0 (session row)", tv.cursor)
+	}
+}
+
+func TestTreeView_SoloForceExpandsCollapsedSession(t *testing.T) {
+	// Needs ≥2 sessions so Solo actually enters solo mode (a lone session is
+	// trivially "already soloed" and Solo is a no-op).
+	tv := NewTreeView()
+	tv.AddSession("sess1", "project1")
+	tv.AddAgent("sess1", "agent1", "")
+	tv.AddSession("sess2", "project2")
+	tv.SetCollapsed("sess1", true)
+	// Cursor at sess1 (collapsed) — tree.nodes is [sess1, sess2, sess2-main]
+	tv.cursor = 0
+
+	tv.Solo()
+
+	session := tv.Root.Children[0]
+	if session.Collapsed {
+		t.Error("Solo on collapsed session should force-expand it")
+	}
+	if !session.Pinned {
+		t.Error("Solo on collapsed session should pin it")
 	}
 }
 
